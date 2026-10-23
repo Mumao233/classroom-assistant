@@ -1,0 +1,33 @@
+# Local classroom recordings, transcripts, answers and settings
+/data/
+/config.json
+/config.local.json
+.env
+.env.*
+!.env.example
+
+# Runtime, model weights and generated artifacts
+/.venv/
+/venv/
+/models/
+/work/
+/outputs/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+*.tmp
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.zip
+*.bin
+*.safetensors
+
+# Editor and local account files
+.idea/
+.vscode/
+.codex/
+.DS_Store
+Thumbs.db

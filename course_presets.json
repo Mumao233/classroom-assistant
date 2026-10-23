@@ -1,0 +1,293 @@
+{
+  "courses": [
+    {
+      "id": "calculus",
+      "name": "微积分",
+      "glossary": [
+        {
+          "term": "Function",
+          "meaning": "函数：将定义域中每个输入对应到唯一输出的关系。",
+          "aliases": []
+        },
+        {
+          "term": "Domain",
+          "meaning": "定义域：函数允许输入的所有取值组成的集合。",
+          "aliases": []
+        },
+        {
+          "term": "Range",
+          "meaning": "值域：函数实际输出的所有取值组成的集合。",
+          "aliases": []
+        },
+        {
+          "term": "Limit",
+          "meaning": "极限：自变量趋近某值或无穷时，函数值趋近的值。",
+          "aliases": []
+        },
+        {
+          "term": "Continuity",
+          "meaning": "连续性：函数在某点的极限等于该点函数值的性质。",
+          "aliases": []
+        },
+        {
+          "term": "Derivative",
+          "meaning": "导数：函数在某点的瞬时变化率。",
+          "aliases": []
+        },
+        {
+          "term": "Differentiation",
+          "meaning": "求导：计算函数导数的过程。",
+          "aliases": []
+        },
+        {
+          "term": "Chain Rule",
+          "meaning": "链式法则：计算复合函数导数的法则。",
+          "aliases": []
+        },
+        {
+          "term": "Implicit Differentiation",
+          "meaning": "隐函数求导：对含隐式函数关系的等式两边求导。",
+          "aliases": []
+        },
+        {
+          "term": "Critical Point",
+          "meaning": "临界点：函数定义域内导数为零或不存在的点。",
+          "aliases": []
+        },
+        {
+          "term": "Local Maximum",
+          "meaning": "局部极大值：函数在某点附近达到的最大值。",
+          "aliases": [
+            "Relative Maximum"
+          ]
+        },
+        {
+          "term": "Local Minimum",
+          "meaning": "局部极小值：函数在某点附近达到的最小值。",
+          "aliases": [
+            "Relative Minimum"
+          ]
+        },
+        {
+          "term": "Mean Value Theorem",
+          "meaning": "中值定理：在满足连续和可导条件时，区间内某点的导数等于区间平均变化率。",
+          "aliases": [
+            "MVT"
+          ]
+        },
+        {
+          "term": "Antiderivative",
+          "meaning": "原函数：求导后得到给定函数的函数。",
+          "aliases": [
+            "Primitive Function"
+          ]
+        },
+        {
+          "term": "Indefinite Integral",
+          "meaning": "不定积分：给定函数的全部原函数所构成的函数族。",
+          "aliases": []
+        },
+        {
+          "term": "Definite Integral",
+          "meaning": "定积分：通过极限累加定义的量，可表示净面积或累计变化量。",
+          "aliases": []
+        },
+        {
+          "term": "Riemann Sum",
+          "meaning": "黎曼和：将区间分割后，用各小区间的函数值与宽度乘积求和。",
+          "aliases": []
+        },
+        {
+          "term": "Fundamental Theorem of Calculus",
+          "meaning": "微积分基本定理：联系求导与积分，并允许用原函数计算定积分的定理。",
+          "aliases": [
+            "FTC"
+          ]
+        },
+        {
+          "term": "Integration by Substitution",
+          "meaning": "换元积分法：通过变量替换简化积分的方法。",
+          "aliases": [
+            "Substitution Rule",
+            "u-Substitution"
+          ]
+        },
+        {
+          "term": "Integration by Parts",
+          "meaning": "分部积分法：利用乘积求导法则转化积分的方法。",
+          "aliases": []
+        },
+        {
+          "term": "Improper Integral",
+          "meaning": "反常积分：积分区间无界或被积函数无界时，以极限定义的积分。",
+          "aliases": []
+        },
+        {
+          "term": "Sequence",
+          "meaning": "数列：按正整数顺序排列的一列数。",
+          "aliases": []
+        },
+        {
+          "term": "Infinite Series",
+          "meaning": "无穷级数：无穷多个数按顺序相加形成的表达式。",
+          "aliases": []
+        },
+        {
+          "term": "Taylor Series",
+          "meaning": "泰勒级数：利用函数在某点的各阶导数构造的幂级数。",
+          "aliases": []
+        }
+      ],
+      "terms": "Function, Domain, Range, Limit, Continuity, Derivative, Differentiation, Chain Rule, Implicit Differentiation, Critical Point, Local Maximum, Local Minimum, Mean Value Theorem, Antiderivative, Indefinite Integral, Definite Integral, Riemann Sum, Fundamental Theorem of Calculus, Integration by Substitution, Integration by Parts, Improper Integral, Sequence, Infinite Series, Taylor Series",
+      "status": "ready",
+      "generated_at": "2026-10-23T13:55:50+00:00"
+    },
+    {
+      "id": "microeconomics",
+      "name": "微观经济学",
+      "glossary": [
+        {
+          "term": "Scarcity",
+          "meaning": "稀缺性：有限资源无法满足所有需求的状况。",
+          "aliases": []
+        },
+        {
+          "term": "Opportunity Cost",
+          "meaning": "机会成本：作出选择时放弃的最佳替代方案的价值。",
+          "aliases": []
+        },
+        {
+          "term": "Production Possibilities Frontier",
+          "meaning": "生产可能性边界：既定资源和技术下能够有效生产的产品组合边界。",
+          "aliases": [
+            "PPF",
+            "Production Possibility Frontier",
+            "Production Possibilities Curve"
+          ]
+        },
+        {
+          "term": "Comparative Advantage",
+          "meaning": "比较优势：以较低机会成本生产某种产品的能力。",
+          "aliases": []
+        },
+        {
+          "term": "Demand",
+          "meaning": "需求：在其他条件不变时，价格与消费者愿意且能够购买的数量之间的关系。",
+          "aliases": []
+        },
+        {
+          "term": "Supply",
+          "meaning": "供给：在其他条件不变时，价格与生产者愿意且能够出售的数量之间的关系。",
+          "aliases": []
+        },
+        {
+          "term": "Market Equilibrium",
+          "meaning": "市场均衡：市场需求量与供给量相等的状态。",
+          "aliases": []
+        },
+        {
+          "term": "Price Elasticity of Demand",
+          "meaning": "需求价格弹性：需求量变化百分比与价格变化百分比之比。",
+          "aliases": [
+            "PED"
+          ]
+        },
+        {
+          "term": "Consumer Surplus",
+          "meaning": "消费者剩余：消费者支付意愿超过实际支付金额的部分。",
+          "aliases": [
+            "CS"
+          ]
+        },
+        {
+          "term": "Producer Surplus",
+          "meaning": "生产者剩余：生产者实际所得超过其最低愿意接受金额的部分。",
+          "aliases": [
+            "PS"
+          ]
+        },
+        {
+          "term": "Deadweight Loss",
+          "meaning": "无谓损失：资源配置偏离有效状态而造成的总剩余损失。",
+          "aliases": [
+            "DWL"
+          ]
+        },
+        {
+          "term": "Utility",
+          "meaning": "效用：消费者从商品或服务中获得的满足程度。",
+          "aliases": []
+        },
+        {
+          "term": "Marginal Utility",
+          "meaning": "边际效用：增加一单位消费带来的额外效用。",
+          "aliases": [
+            "MU"
+          ]
+        },
+        {
+          "term": "Budget Constraint",
+          "meaning": "预算约束：收入和价格对消费者可负担消费组合的限制。",
+          "aliases": []
+        },
+        {
+          "term": "Indifference Curve",
+          "meaning": "无差异曲线：给消费者带来相同效用的消费组合所形成的曲线。",
+          "aliases": []
+        },
+        {
+          "term": "Marginal Cost",
+          "meaning": "边际成本：增加一单位产量带来的额外总成本。",
+          "aliases": [
+            "MC"
+          ]
+        },
+        {
+          "term": "Marginal Revenue",
+          "meaning": "边际收益：增加一单位销量带来的额外总收益。",
+          "aliases": [
+            "MR"
+          ]
+        },
+        {
+          "term": "Economies of Scale",
+          "meaning": "规模经济：长期平均成本随产量增加而下降的现象。",
+          "aliases": []
+        },
+        {
+          "term": "Perfect Competition",
+          "meaning": "完全竞争：众多买卖双方交易同质产品，且单个参与者无法影响市场价格的市场结构。",
+          "aliases": []
+        },
+        {
+          "term": "Monopoly",
+          "meaning": "垄断：单一卖方供应缺乏密切替代品的产品，且市场存在进入壁垒的市场结构。",
+          "aliases": []
+        },
+        {
+          "term": "Monopolistic Competition",
+          "meaning": "垄断竞争：众多企业销售差异化产品且进入退出较自由的市场结构。",
+          "aliases": []
+        },
+        {
+          "term": "Oligopoly",
+          "meaning": "寡头垄断：少数企业主导市场且决策相互影响的市场结构。",
+          "aliases": []
+        },
+        {
+          "term": "Externality",
+          "meaning": "外部性：经济活动对交易之外的第三方产生且未由市场价格充分反映的影响。",
+          "aliases": []
+        },
+        {
+          "term": "Public Good",
+          "meaning": "公共物品：具有非排他性和非竞争性的物品。",
+          "aliases": []
+        }
+      ],
+      "terms": "Scarcity, Opportunity Cost, Production Possibilities Frontier, Comparative Advantage, Demand, Supply, Market Equilibrium, Price Elasticity of Demand, Consumer Surplus, Producer Surplus, Deadweight Loss, Utility, Marginal Utility, Budget Constraint, Indifference Curve, Marginal Cost, Marginal Revenue, Economies of Scale, Perfect Competition, Monopoly, Monopolistic Competition, Oligopoly, Externality, Public Good",
+      "status": "ready",
+      "generated_at": "2026-10-23T13:55:50+00:00"
+    }
+  ]
+}

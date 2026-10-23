@@ -1,0 +1,11 @@
+{
+  "mode": "auto",
+  "cpu_model_path": "models/faster-whisper-small",
+  "gpu_model_path": "models/faster-whisper-large-v3-turbo",
+  "cuda_library_dirs": [],
+  "cpu_threads": 6,
+  "beam_size": 1,
+  "max_audio_seconds": 20,
+  "codex_timeout_seconds": 120,
+  "codex_context_chars": 48000
+}

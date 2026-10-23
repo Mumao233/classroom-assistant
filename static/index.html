@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#234f43">
+  <title>课间 · 课堂助手</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <a href="/" class="brand" aria-label="课间课堂助手首页"><span class="brand-mark" aria-hidden="true">课</span><span>课间<small>把课堂，听明白。</small></span></a>
+      <nav class="session-nav" aria-label="课程管理">
+        <label class="sr-only" for="session-select">历史课程</label>
+        <select id="session-select" aria-label="历史课程"><option>正在连接…</option></select>
+        <button id="new-session" class="button subtle">新建一节课</button>
+      </nav>
+      <div class="header-actions">
+        <button id="focus-button" class="text-button" aria-pressed="false">专注模式</button>
+        <button id="return-live" class="text-button" hidden>回到实时 ↓</button>
+        <button id="demo-button" class="text-button">体验演示</button>
+        <details class="export-menu"><summary class="button subtle">导出笔记 <span aria-hidden="true">↓</span></summary><div class="menu-popover"><button data-export="markdown">Markdown 笔记</button><button data-export="json">JSON 完整记录</button><button id="copy-codex">复制给 Codex</button></div></details>
+      </div>
+    </header>
+
+    <div id="connection-banner" class="connection-banner" role="status" hidden></div>
+    <div id="demo-banner" class="demo-banner" hidden><strong>演示课程</strong><span>以下为固定示例，不录音、不调用 AI。开始录音会自动新建真实课程。</span></div>
+
+    <section class="course-toolbar" aria-label="课程设置">
+      <div class="course-title"><label for="course-title">正在学习</label><input id="course-title" value="未命名课程" aria-label="课程名称" maxlength="150"><span id="save-status" class="save-status">本地保存</span></div>
+      <div class="terms-field"><label for="course-terms">本节课术语 <span>帮助识别专有名词</span></label><input id="course-terms" placeholder="如 opportunity cost, marginal utility, 机会成本" maxlength="2000"></div>
+      <div class="engine-status"><span id="asr-status" class="status-pill">转写器检查中</span><span id="codex-status" class="status-pill">Codex 检查中</span></div>
+    </section>
+
+    <section class="study-tools" aria-label="课前准备">
+      <div class="preset-controls"><label for="course-preset">课程预设</label><select id="course-preset"><option value="">不使用预设</option></select><button id="course-manage" class="text-button">术语与大纲</button><button id="course-new" class="text-button">新建</button><button id="course-rename" class="text-button">改名</button></div>
+      <div class="mode-controls"><label for="runtime-mode">运行模式</label><select id="runtime-mode"><option value="auto">自动 · 跟随电源</option><option value="battery">电池省电</option><option value="quality">插电高质量</option></select><span id="actual-mode" class="small muted"></span></div>
+    </section>
+
+    <div id="runtime-note" class="runtime-note" role="status" hidden></div>
+
+    <main class="workspace">
+      <section class="panel transcript-panel" aria-labelledby="transcript-heading">
+        <div class="panel-heading"><div><span class="eyebrow">01 / LISTEN</span><h1 id="transcript-heading">课堂原文 <span id="segment-count" class="count">0</span></h1></div><span id="recording-clock" class="clock">00:00</span></div>
+        <div class="record-controls">
+          <div class="mic-row"><label class="sr-only" for="microphone">录音麦克风</label><select id="microphone"><option value="">系统默认麦克风</option></select><button id="refresh-mics" class="icon-button" aria-label="刷新麦克风列表" title="刷新麦克风列表">↻</button></div>
+          <button id="record-button" class="button primary record-button"><span id="record-dot" class="record-dot" aria-hidden="true"></span><span id="record-label">开始录音</span></button>
+          <div class="soundcheck-actions"><button id="soundcheck-button" class="text-button">十秒试音</button><span class="small muted">试音不加入课堂记录</span></div>
+          <div class="meter-row"><span id="capture-status">麦克风未开启</span><div class="meter" role="meter" aria-label="麦克风音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="volume-meter"></span></div></div>
+          <p id="capture-health" class="capture-health" role="status" hidden></p>
+          <details id="soundcheck-result" class="soundcheck-result" hidden><summary>试音结果</summary><p id="soundcheck-status"></p><audio id="soundcheck-player" controls preload="none" hidden></audio><p id="soundcheck-text"></p><p id="soundcheck-warning" class="review-note"></p><button id="soundcheck-retry" class="text-button" hidden>重试试音转写</button></details>
+          <p class="privacy-note">音频保存在本机；开启 AI 分析或提问后，课堂文字会发至 Codex。请先确认课堂允许录音。</p>
+          <div id="audio-queue" class="queue-note" hidden><span id="audio-queue-text"></span><button id="retry-audio" class="text-button" hidden>重试发送</button></div>
+        </div>
+        <div id="transcript-list" class="panel-scroll transcript-list" aria-live="polite" aria-relevant="additions text"><div class="empty-state"><span class="empty-number">A → 文</span><h2>从老师的第一句话开始</h2><p>选择麦克风并开始录音。英语为主、夹杂中文，也保留原语言。</p><p class="small">本地模型需要处理时间，文字会分段出现。</p></div></div>
+        <details class="manual-input"><summary>手动补充原文 / 录音不可用时</summary><form id="text-form"><label class="sr-only" for="manual-text">手动输入课堂原文</label><textarea id="manual-text" rows="3" placeholder="粘贴课堂原文，或补上一段没听清的内容…" required maxlength="30000"></textarea><button id="add-text" class="button subtle" type="submit">加入本节课</button></form></details>
+      </section>
+
+      <section class="panel groups-panel" aria-labelledby="groups-heading">
+        <div class="panel-heading"><div><span class="eyebrow">02 / UNDERSTAND</span><h2 id="groups-heading">意群笔记 <span id="group-count" class="count">0</span></h2></div><button id="flush-button" class="text-button" title="将目前已接收的课堂内容整理为一个意群">整理当前意群</button></div>
+        <div class="analysis-controls"><label class="switch"><input id="auto-analyze" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span id="analysis-mode-label">逐段解释</span></label><span id="analysis-mode-hint" class="small muted">积累完整上下文后整理</span></div>
+        <div id="ai-recovery" class="ai-recovery" role="status" hidden><strong id="ai-pause-title">AI 已暂停</strong><p id="ai-pause-reason"></p><p class="small">本机录音、转写仍可继续。恢复后选择：</p><div><button data-ai-resume="backfill" class="button subtle">补上未分析内容</button><button data-ai-resume="latest" class="button subtle">从最新内容继续</button></div></div>
+        <div id="groups-list" class="panel-scroll groups-list" aria-live="polite"><div class="empty-state"><span class="empty-number">听见 → 理解</span><h3>把零散句子，连成一个意思</h3><p>课堂内容会按意群归档。打开自动分析后，Codex 会解释重点、术语和前后联系。</p><p class="small">也可以随时点击「整理当前意群」。</p></div></div>
+        <div class="panel-footnote"><span class="small muted">AI 解读可能有误，请对照原文与课堂材料。</span><span id="ai-queue" class="small"></span></div>
+      </section>
+
+      <section class="panel questions-panel" aria-labelledby="questions-heading">
+        <div class="panel-heading"><div><span class="eyebrow">03 / ASK</span><h2 id="questions-heading">随堂问答</h2></div><span class="context-badge">当前课程</span></div>
+        <div id="questions-list" class="panel-scroll questions-list" aria-live="polite"><div class="empty-state question-empty"><span class="empty-number">为什么？</span><h3>不懂的地方，现在就问</h3><p>回答会参考本节课已转写的内容。也可选中某个意群，聚焦这一段。</p><div class="suggestions"><button data-question="用中文解释刚才的内容，并给一个简单例子。">这段能举个例子吗？</button><button data-question="刚才提到的英文术语是什么意思？请结合课堂上下文解释。">刚才的英文术语是什么意思？</button><button data-question="老师刚才的结论是怎么推导出来的？请逐步解释。">这个结论是怎么来的？</button></div></div></div>
+        <form id="question-form" class="question-composer"><div id="question-context" class="question-context" hidden><span id="context-label"></span><button type="button" id="clear-context" aria-label="清除所选意群">×</button></div><label class="sr-only" for="question-input">提问内容</label><textarea id="question-input" rows="3" placeholder="用中文问也可以，例如：为什么这样计算？" required maxlength="10000"></textarea><div class="composer-footer"><span>Enter 发送 · Shift + Enter 换行</span><button id="ask-button" class="button primary" type="submit">发送问题 <span aria-hidden="true">↑</span></button></div></form>
+      </section>
+    </main>
+    <details class="after-class"><summary>课后处理 <span id="revision-count" class="small muted"></span></summary><div class="after-class-controls"><div><button id="retranscribe-button" class="button subtle">高质量重转写</button><p id="retranscribe-note" class="small muted">需插电并有可用 NVIDIA 独显。课堂原版保留，修订稿另存。</p></div><button id="delete-audio-button" class="text-button danger">删除本节课录音</button></div><div id="revisions-list"></div></details>
+    <footer class="app-footer"><span><span id="connection-dot" class="connection-dot"></span><span id="connection-label">连接本地服务…</span></span><span id="processing-status">音频 → 本机转写 → 意群 → Codex</span><span class="footer-shortcut">课程记录存于本机</span></footer>
+  </div>
+  <div id="toast" class="toast" role="status" hidden></div>
+  <dialog id="new-session-dialog"><form id="new-session-form"><span class="eyebrow">NEW CLASS</span><h2>新的一节课</h2><label for="new-title">课程名称</label><input id="new-title" placeholder="例如：经济学 · 消费者选择" maxlength="150" autocomplete="off"><div class="dialog-actions"><button type="button" id="cancel-new-session" class="button subtle">取消</button><button type="submit" class="button primary">创建课程</button></div></form></dialog>
+  <dialog id="course-dialog"><form id="course-form"><span class="eyebrow">COURSE PRESET</span><h2 id="course-dialog-title">新建课程预设</h2><label for="course-name">课程名称</label><input id="course-name" maxlength="120" required placeholder="例如：微积分"><p class="dialog-help">预设保存术语，可在不同课堂中重复使用。</p><div class="dialog-actions"><button type="button" data-close-dialog="course-dialog" class="button subtle">取消</button><button class="button primary" type="submit">保存预设</button></div></form></dialog>
+  <dialog id="glossary-dialog" class="wide-dialog"><form id="glossary-form"><span class="eyebrow">TERMS & SYLLABUS</span><h2 id="glossary-title">课程术语与大纲</h2><p class="dialog-help">Codex 生成英文术语、中文释义和常见缩写，保存后可重复使用。术语仅供识别和理解参考，不代表老师已讲过。</p><label for="course-syllabus">补充章节或大纲（可选）</label><textarea id="course-syllabus" rows="4" maxlength="20000" placeholder="如本节课：极限、导数定义、链式法则。也可以直接粘贴大纲文本。"></textarea><div class="dialog-actions"><button type="button" data-close-dialog="glossary-dialog" class="button subtle">关闭</button><button id="generate-glossary" class="button primary" type="submit">生成 / 刷新术语</button></div><p id="glossary-status" class="dialog-help" role="status"></p><div id="glossary-content" class="analysis-content"></div></form></dialog>
+  <dialog id="edit-segment-dialog" class="wide-dialog"><form id="edit-segment-form"><span class="eyebrow">CORRECT TRANSCRIPT</span><h2>修改课堂原文</h2><p class="dialog-help">原始机器转写会保留。已有解释会标记为待更新，由你选择是否重新分析。</p><label for="edit-segment-text">修正后的原文</label><textarea id="edit-segment-text" rows="7" maxlength="30000" required></textarea><details class="original-text"><summary>查看原始机器转写</summary><p id="edit-original-text"></p></details><div class="dialog-actions"><button type="button" data-close-dialog="edit-segment-dialog" class="button subtle">取消</button><button class="button primary" type="submit">保存修改</button></div></form></dialog>
+  <dialog id="delete-audio-dialog"><form id="delete-audio-form"><span class="eyebrow">LOCAL RECORDINGS</span><h2>只删录音，文字保留</h2><p class="dialog-help">将删除本节课已保存的录音，无法再回听或基于这些录音重新转写。转写文字、意群笔记、问答和修订稿会保留。</p><div class="dialog-actions"><button type="button" data-close-dialog="delete-audio-dialog" class="button subtle">取消</button><button class="button danger-button" type="submit">确认删除录音</button></div></form></dialog>
+</body>
+</html>
