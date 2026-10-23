@@ -135,7 +135,15 @@ class ClassroomFeatures:
         result = self.engine.set_mode(mode)
         with self.lock:
             self.config["mode"] = mode
-            write_json(self.data / "preferences.json", {"mode": mode})
+            path = self.data / "preferences.json"
+            try:
+                preferences = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+                if not isinstance(preferences, dict):
+                    preferences = {}
+            except (OSError, ValueError):
+                preferences = {}
+            preferences["mode"] = mode
+            write_json(path, preferences)
         return result
 
     def edit_segment(self, sid, segid, text):
@@ -184,19 +192,22 @@ class ClassroomFeatures:
                     item["status"] = "paused"
                     if item.get("job_id") in self.jobs:
                         self.jobs[item["job_id"]]["status"] = "paused"
-            self.save(s)
         for c in self.courses:
             if c.get("status") == "pending":
                 c["status"] = "paused"
                 if c.get("job_id") in self.jobs:
                     self.jobs[c["job_id"]]["status"] = "paused"
-        self.save_courses()
         write_json(self.data / "ai-state.json", self.ai)
+        for s in self.sessions.values():
+            self.save(s)
+        self.save_courses()
 
     def resume_ai(self, strategy):
         if strategy not in ("backfill", "latest"):
             raise HTTPException(400, "请选择补分析或从最新继续。")
         with self.lock:
+            if self.ai_switch_pending:
+                raise HTTPException(409, "当前 AI 请求尚未结束，请等待接入切换完成后恢复。")
             self.ai.update(paused=False, kind=None, reason=None)
             for s in self.sessions.values():
                 pending = [g for g in s["groups"] if g.get("status") == "paused"]
@@ -213,7 +224,7 @@ class ClassroomFeatures:
                 self.save(s)
             for c in self.courses:
                 if c.get("status") == "paused":
-                    self._enqueue_ai(self.get(), c, "glossary")
+                    self._enqueue_ai(self.get(c.get("ai_session_id")), c, "glossary")
             self.save_courses()
             write_json(self.data / "ai-state.json", self.ai)
             self.ai_ready.set()

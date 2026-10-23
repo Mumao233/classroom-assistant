@@ -94,6 +94,15 @@ def _process_options() -> dict[str, Any]:
     return options
 
 
+def _subprocess_environment() -> dict[str, str]:
+    """Do not give account-backed Codex the API mode's environment keys."""
+    excluded = {"CODEX_THREAD_ID", "CODEX_TURN_ID", "OPENAI_KEY", "AZURE_OPENAI_KEY",
+                "ANTHROPIC_AUTH_TOKEN", "OPENAI_ACCESS_TOKEN"}
+    return {name: value for name, value in os.environ.items()
+            if name.upper() not in excluded
+            and not any(marker in name.upper() for marker in ("API_KEY", "API_TOKEN"))}
+
+
 def _kill_process_tree(process: subprocess.Popen) -> None:
     """Terminate only the process group/tree created for this request."""
     if process.poll() is not None:
@@ -197,7 +206,7 @@ class CodexBridge:
             login = subprocess.run(
                 [self.executable, "login", "status"], capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=10,
-                check=False, **_process_options(),
+                check=False, env=_subprocess_environment(), **_process_options(),
             )
             message = (login.stdout + login.stderr).lower()
             result["logged_in"] = login.returncode == 0 and "logged in" in message
@@ -206,7 +215,7 @@ class CodexBridge:
             version = subprocess.run(
                 [self.executable, "--version"], capture_output=True,
                 text=True, encoding="utf-8", errors="replace", timeout=8,
-                check=False, **_process_options(),
+                check=False, env=_subprocess_environment(), **_process_options(),
             )
             match = re.search(r"codex-cli\s+([\w.\-+]+)", version.stdout)
             result["version"] = match.group(1) if match else None
@@ -242,10 +251,7 @@ class CodexBridge:
         started = time.monotonic()
         with self._lock:
             self._active += 1
-        environment = os.environ.copy()
-        # Avoid incorrectly inheriting the parent chat's tracing identity.
-        for name in ("CODEX_THREAD_ID", "CODEX_TURN_ID"):
-            environment.pop(name, None)
+        environment = _subprocess_environment()
         try:
             command = self._command()
             process = subprocess.Popen(

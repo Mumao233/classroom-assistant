@@ -1,5 +1,17 @@
 # 验证记录与已知边界
 
+## v1.1.0 发布验证 · 2026-10-24
+
+- 全套 Python 回归：**160 项测试、124 个子测试通过**。覆盖 Chat Completions SSE / JSON、流式中断与输出校验、HTTP 错误分类、缺失用量、无自动重试与重定向、Codex 环境隔离、实际 Windows DPAPI 合成密钥往返、保存失败回滚、接入切换、队列暂停、API 默认关闭自动分析、旧数据兼容及中断费用未知状态。
+- 网页 AI 设置模拟测试：28 次请求通过；原 UI 生命周期回归的 27 次模拟请求通过。Node 音频连续重采样与分段检查、JavaScript 语法检查、PowerShell 启动脚本语法检查通过。
+- 实际浏览器在隔离的本机服务中完成配置填写、测试连接、保存、清空密码显示、API 提问、正式结果与用量展示。使用合成课堂、合成密钥、MockTransport，不读取真实课堂，也不发收费 API 请求。
+- 发布时未配置真实第三方 API 密钥，因此没有验证某一家真实服务商、真实模型的稳定性、速度或账单。需要使用者在网页填入自己的设置并执行测试连接。
+- API 调用次数是持久记录的尝试次数；进程中断时可能无法知道服务商是否已经计费，单列为结果未知。token 只统计实际返回的数据；它不是账单或金额预算。
+
+![v1.1.0 AI 设置，合成验证](preview-api.jpg)
+
+## v1.0.0 历史验证
+
 验证日期：2026-10-23。下列性能来自一台 Windows 笔记本上的合成语音测试，不是通用性能保证，也不代表真实课堂识别准确率。[界面预览](preview.jpg)同样使用合成课堂示例。
 
 ## 自动化与界面检查
@@ -64,6 +76,7 @@
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python.exe -m pytest tests -q
 node tests/audio.cjs
+node tests/ai-settings.cjs
 node --check static/app.js
 node --check static/pcm-worklet.js
 ```

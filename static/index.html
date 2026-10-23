@@ -18,10 +18,11 @@
         <button id="new-session" class="button subtle">新建一节课</button>
       </nav>
       <div class="header-actions">
+        <button id="ai-settings-button" class="text-button">AI 接入</button>
         <button id="focus-button" class="text-button" aria-pressed="false">专注模式</button>
         <button id="return-live" class="text-button" hidden>回到实时 ↓</button>
         <button id="demo-button" class="text-button">体验演示</button>
-        <details class="export-menu"><summary class="button subtle">导出笔记 <span aria-hidden="true">↓</span></summary><div class="menu-popover"><button data-export="markdown">Markdown 笔记</button><button data-export="json">JSON 完整记录</button><button id="copy-codex">复制给 Codex</button></div></details>
+        <details class="export-menu"><summary class="button subtle">导出笔记 <span aria-hidden="true">↓</span></summary><div class="menu-popover"><button data-export="markdown">Markdown 笔记</button><button data-export="json">JSON 完整记录</button><button id="copy-codex">复制课堂上下文</button></div></details>
       </div>
     </header>
 
@@ -31,7 +32,7 @@
     <section class="course-toolbar" aria-label="课程设置">
       <div class="course-title"><label for="course-title">正在学习</label><input id="course-title" value="未命名课程" aria-label="课程名称" maxlength="150"><span id="save-status" class="save-status">本地保存</span></div>
       <div class="terms-field"><label for="course-terms">本节课术语 <span>帮助识别专有名词</span></label><input id="course-terms" placeholder="如 opportunity cost, marginal utility, 机会成本" maxlength="2000"></div>
-      <div class="engine-status"><span id="asr-status" class="status-pill">转写器检查中</span><span id="codex-status" class="status-pill">Codex 检查中</span></div>
+      <div class="engine-status"><span id="asr-status" class="status-pill">转写器检查中</span><span id="codex-status" class="status-pill">AI 检查中</span></div>
     </section>
 
     <section class="study-tools" aria-label="课前准备">
@@ -51,7 +52,7 @@
           <div class="meter-row"><span id="capture-status">麦克风未开启</span><div class="meter" role="meter" aria-label="麦克风音量" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="volume-meter"></span></div></div>
           <p id="capture-health" class="capture-health" role="status" hidden></p>
           <details id="soundcheck-result" class="soundcheck-result" hidden><summary>试音结果</summary><p id="soundcheck-status"></p><audio id="soundcheck-player" controls preload="none" hidden></audio><p id="soundcheck-text"></p><p id="soundcheck-warning" class="review-note"></p><button id="soundcheck-retry" class="text-button" hidden>重试试音转写</button></details>
-          <p class="privacy-note">音频保存在本机；开启 AI 分析或提问后，课堂文字会发至 Codex。请先确认课堂允许录音。</p>
+          <p class="privacy-note">音频保存在本机；开启 AI 分析或提问后，课堂文字会发送至所选 AI 服务。请先确认课堂允许录音。</p>
           <div id="audio-queue" class="queue-note" hidden><span id="audio-queue-text"></span><button id="retry-audio" class="text-button" hidden>重试发送</button></div>
         </div>
         <div id="transcript-list" class="panel-scroll transcript-list" aria-live="polite" aria-relevant="additions text"><div class="empty-state"><span class="empty-number">A → 文</span><h2>从老师的第一句话开始</h2><p>选择麦克风并开始录音。英语为主、夹杂中文，也保留原语言。</p><p class="small">本地模型需要处理时间，文字会分段出现。</p></div></div>
@@ -62,7 +63,7 @@
         <div class="panel-heading"><div><span class="eyebrow">02 / UNDERSTAND</span><h2 id="groups-heading">意群笔记 <span id="group-count" class="count">0</span></h2></div><button id="flush-button" class="text-button" title="将目前已接收的课堂内容整理为一个意群">整理当前意群</button></div>
         <div class="analysis-controls"><label class="switch"><input id="auto-analyze" type="checkbox"><span class="switch-track" aria-hidden="true"></span><span id="analysis-mode-label">逐段解释</span></label><span id="analysis-mode-hint" class="small muted">积累完整上下文后整理</span></div>
         <div id="ai-recovery" class="ai-recovery" role="status" hidden><strong id="ai-pause-title">AI 已暂停</strong><p id="ai-pause-reason"></p><p class="small">本机录音、转写仍可继续。恢复后选择：</p><div><button data-ai-resume="backfill" class="button subtle">补上未分析内容</button><button data-ai-resume="latest" class="button subtle">从最新内容继续</button></div></div>
-        <div id="groups-list" class="panel-scroll groups-list" aria-live="polite"><div class="empty-state"><span class="empty-number">听见 → 理解</span><h3>把零散句子，连成一个意思</h3><p>课堂内容会按意群归档。打开自动分析后，Codex 会解释重点、术语和前后联系。</p><p class="small">也可以随时点击「整理当前意群」。</p></div></div>
+        <div id="groups-list" class="panel-scroll groups-list" aria-live="polite"><div class="empty-state"><span class="empty-number">听见 → 理解</span><h3>把零散句子，连成一个意思</h3><p>课堂内容会按意群归档。打开逐段解释后，AI 会解释重点、术语和前后联系。</p><p class="small">也可以随时点击「整理当前意群」。</p></div></div>
         <div class="panel-footnote"><span class="small muted">AI 解读可能有误，请对照原文与课堂材料。</span><span id="ai-queue" class="small"></span></div>
       </section>
 
@@ -73,12 +74,34 @@
       </section>
     </main>
     <details class="after-class"><summary>课后处理 <span id="revision-count" class="small muted"></span></summary><div class="after-class-controls"><div><button id="retranscribe-button" class="button subtle">高质量重转写</button><p id="retranscribe-note" class="small muted">需插电并有可用 NVIDIA 独显。课堂原版保留，修订稿另存。</p></div><button id="delete-audio-button" class="text-button danger">删除本节课录音</button></div><div id="revisions-list"></div></details>
-    <footer class="app-footer"><span><span id="connection-dot" class="connection-dot"></span><span id="connection-label">连接本地服务…</span></span><span id="processing-status">音频 → 本机转写 → 意群 → Codex</span><span class="footer-shortcut">课程记录存于本机</span></footer>
+    <div id="ai-usage" class="ai-usage" role="status">本课 API：尚无请求</div>
+    <footer class="app-footer"><span><span id="connection-dot" class="connection-dot"></span><span id="connection-label">连接本地服务…</span></span><span id="processing-status">音频 → 本机转写 → 意群 → AI</span><span class="footer-shortcut">课间 1.1.0 · 课程记录存于本机</span></footer>
   </div>
   <div id="toast" class="toast" role="status" hidden></div>
   <dialog id="new-session-dialog"><form id="new-session-form"><span class="eyebrow">NEW CLASS</span><h2>新的一节课</h2><label for="new-title">课程名称</label><input id="new-title" placeholder="例如：经济学 · 消费者选择" maxlength="150" autocomplete="off"><div class="dialog-actions"><button type="button" id="cancel-new-session" class="button subtle">取消</button><button type="submit" class="button primary">创建课程</button></div></form></dialog>
   <dialog id="course-dialog"><form id="course-form"><span class="eyebrow">COURSE PRESET</span><h2 id="course-dialog-title">新建课程预设</h2><label for="course-name">课程名称</label><input id="course-name" maxlength="120" required placeholder="例如：微积分"><p class="dialog-help">预设保存术语，可在不同课堂中重复使用。</p><div class="dialog-actions"><button type="button" data-close-dialog="course-dialog" class="button subtle">取消</button><button class="button primary" type="submit">保存预设</button></div></form></dialog>
-  <dialog id="glossary-dialog" class="wide-dialog"><form id="glossary-form"><span class="eyebrow">TERMS & SYLLABUS</span><h2 id="glossary-title">课程术语与大纲</h2><p class="dialog-help">Codex 生成英文术语、中文释义和常见缩写，保存后可重复使用。术语仅供识别和理解参考，不代表老师已讲过。</p><label for="course-syllabus">补充章节或大纲（可选）</label><textarea id="course-syllabus" rows="4" maxlength="20000" placeholder="如本节课：极限、导数定义、链式法则。也可以直接粘贴大纲文本。"></textarea><div class="dialog-actions"><button type="button" data-close-dialog="glossary-dialog" class="button subtle">关闭</button><button id="generate-glossary" class="button primary" type="submit">生成 / 刷新术语</button></div><p id="glossary-status" class="dialog-help" role="status"></p><div id="glossary-content" class="analysis-content"></div></form></dialog>
+  <dialog id="glossary-dialog" class="wide-dialog"><form id="glossary-form"><span class="eyebrow">TERMS & SYLLABUS</span><h2 id="glossary-title">课程术语与大纲</h2><p class="dialog-help">AI 生成英文术语、中文释义和常见缩写，保存后可重复使用。术语仅供识别和理解参考，不代表老师已讲过。</p><label for="course-syllabus">补充章节或大纲（可选）</label><textarea id="course-syllabus" rows="4" maxlength="20000" placeholder="如本节课：极限、导数定义、链式法则。也可以直接粘贴大纲文本。"></textarea><div class="dialog-actions"><button type="button" data-close-dialog="glossary-dialog" class="button subtle">关闭</button><button id="generate-glossary" class="button primary" type="submit">生成 / 刷新术语</button></div><p id="glossary-status" class="dialog-help" role="status"></p><div id="glossary-content" class="analysis-content"></div></form></dialog>
+  <dialog id="ai-settings-dialog" class="wide-dialog ai-settings-dialog" aria-labelledby="ai-settings-title">
+    <form id="ai-settings-form" autocomplete="off">
+      <span class="eyebrow">AI CONNECTION</span><h2 id="ai-settings-title">选择课堂 AI</h2>
+      <p class="dialog-help">使用已登录的 Codex 账号，或连接支持 Chat Completions 的 API 服务。录音和转写仍在本机完成。</p>
+      <p id="ai-active-settings" class="ai-active-settings" role="status"></p>
+      <label for="ai-provider">接入方式</label><select id="ai-provider"><option value="codex">Codex · 现有账号</option><option value="api">API · 自定义服务</option></select>
+      <p id="ai-codex-help" class="dialog-help">使用本机已登录的 Codex 账号和额度，无需填写 API 密钥。</p>
+      <fieldset id="ai-api-fields" hidden>
+        <legend class="sr-only">API 配置</legend>
+        <label for="ai-base-url">API Base URL</label><input id="ai-base-url" type="url" placeholder="https://api.example.com/v1" autocomplete="off" spellcheck="false" maxlength="2048"><p class="field-help">填写服务商提供的接口根地址，课堂文字将发送至此服务。更换地址后需重新输入密钥。</p>
+        <label for="ai-model">模型名称</label><input id="ai-model" placeholder="填写服务商提供的模型 ID" autocomplete="off" spellcheck="false" maxlength="160">
+        <label for="ai-key">API 密钥</label><input id="ai-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="同一接口下留空保留已有密钥" maxlength="4096" aria-describedby="ai-key-status"><p id="ai-key-status" class="field-help"></p>
+        <label class="checkbox-label"><input id="ai-remember-key" type="checkbox"><span>记住密钥，供下次启动使用</span></label><p id="ai-storage-help" class="field-help">默认仅本次服务运行使用，关闭服务后需要重新输入。</p>
+        <label class="checkbox-label"><input id="ai-clear-key" type="checkbox"><span>保存时清除已有密钥</span></label>
+        <p class="ai-cost-note">API 按服务商规则计费，与 ChatGPT / Codex 订阅额度分开。切换到 API 或更换 API 配置后，逐段解释会关闭，可在本节课手动开启。</p>
+      </fieldset>
+      <p class="dialog-help ai-test-help">API「测试连接」会使用当前填写的配置发送一小段测试文字，可能产生少量用量。Codex「检查登录」仅检查本机登录状态。两者都不会保存配置或发送课堂内容。</p>
+      <p id="ai-settings-result" class="ai-settings-result" role="status" hidden></p>
+      <div class="dialog-actions"><button type="button" data-close-dialog="ai-settings-dialog" class="button subtle">关闭</button><button id="ai-test-button" type="button" class="button subtle">测试连接</button><button id="ai-save-button" type="submit" class="button primary">保存设置</button></div>
+    </form>
+  </dialog>
   <dialog id="edit-segment-dialog" class="wide-dialog"><form id="edit-segment-form"><span class="eyebrow">CORRECT TRANSCRIPT</span><h2>修改课堂原文</h2><p class="dialog-help">原始机器转写会保留。已有解释会标记为待更新，由你选择是否重新分析。</p><label for="edit-segment-text">修正后的原文</label><textarea id="edit-segment-text" rows="7" maxlength="30000" required></textarea><details class="original-text"><summary>查看原始机器转写</summary><p id="edit-original-text"></p></details><div class="dialog-actions"><button type="button" data-close-dialog="edit-segment-dialog" class="button subtle">取消</button><button class="button primary" type="submit">保存修改</button></div></form></dialog>
   <dialog id="delete-audio-dialog"><form id="delete-audio-form"><span class="eyebrow">LOCAL RECORDINGS</span><h2>只删录音，文字保留</h2><p class="dialog-help">将删除本节课已保存的录音，无法再回听或基于这些录音重新转写。转写文字、意群笔记、问答和修订稿会保留。</p><div class="dialog-actions"><button type="button" data-close-dialog="delete-audio-dialog" class="button subtle">取消</button><button class="button danger-button" type="submit">确认删除录音</button></div></form></dialog>
 </body>

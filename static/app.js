@@ -14,6 +14,7 @@
     focusMode: false, followLive: true, courseAction: 'create', editingSegment: null,
     modeSaving: false, selectedCourseBusy: false, glossaryCourseId: null,
     soundcheck: null, captureKind: 'classroom', flushing: false, retranscribeSubmitting: false, glossarySubmitting: false,
+    aiSettings: null, aiSettingsBusy: false, aiResuming: false,
   };
 
   const escapeHTML = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
@@ -119,6 +120,151 @@
   const emptyGroups = $('#groups-list').innerHTML;
   const emptyQuestions = $('#questions-list').innerHTML;
 
+  const providerLabel = (provider) => ({ codex: 'Codex', api: 'API' })[provider] || 'AI';
+  const tokenCount = (value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+
+  function usageText(usage) {
+    if (!usage || typeof usage !== 'object') return '令牌用量未返回';
+    const input = tokenCount(usage.prompt_tokens ?? usage.input_tokens);
+    const output = tokenCount(usage.completion_tokens ?? usage.output_tokens);
+    const total = tokenCount(usage.total_tokens) ?? (input !== null && output !== null ? input + output : null);
+    if (total === null) return '令牌用量未返回';
+    return `${total.toLocaleString('zh-CN')} tokens${input !== null && output !== null ? `（输入 ${input.toLocaleString('zh-CN')} / 输出 ${output.toLocaleString('zh-CN')}）` : ''}`;
+  }
+
+  function responseAttribution(item, draft = false) {
+    const provider = draft ? item.stream_provider || item.ai_provider : item.ai_provider;
+    // An explicit stream provider owns its model, including an unknown/default
+    // model. A retry must never inherit the previous answer's different model.
+    const model = draft ? item.stream_provider ? item.stream_model : item.stream_model || item.ai_model : item.ai_model;
+    return [providerLabel(provider), model, !draft && provider === 'api' ? usageText(item.usage) : ''].filter(Boolean).join(' · ');
+  }
+
+  function renderAIResponse(item, answer, question = false) {
+    const drafting = ['streaming', 'interrupted'].includes(item.stream_status);
+    const pending = isPending(item.status);
+    let html = answer ? `<div class="response-attribution">${isDemo() ? '固定示例' : `正式${question ? '回答' : '解释'} · ${escapeHTML(responseAttribution(item))}`}</div><div class="analysis-content">${markdown(answer)}</div>` : '';
+    if (drafting) {
+      const interrupted = item.stream_status === 'interrupted';
+      html += `<section class="stream-draft${interrupted ? ' interrupted' : ''}" aria-label="${interrupted ? '已中断的临时内容' : '正在生成的临时内容'}"><div class="stream-label">${interrupted ? '生成中断 · 以下未形成正式回答' : '正在生成 · 临时内容'}${answer ? ' · 原回答保留在上方' : ''}</div><div class="response-attribution">${escapeHTML(responseAttribution(item, true))}</div><div class="analysis-content">${item.streaming_text ? markdown(item.streaming_text) : `<p>${interrupted ? '未收到可用文字。' : '等待返回内容…'}</p>`}</div></section>`;
+    } else if (pending) {
+      html += `<p class="analysis-pending">${answer ? '正在重新生成，原回答保留供对照。' : question ? '正在等待 AI 解答，你可以继续提问…' : '已加入处理队列，完成后会显示在这里。你可以继续听课。'}</p>`;
+    }
+    if (item.error) html += `<p class="analysis-error">${escapeHTML(item.error)}</p>`;
+    if (!html) html = `<p class="analysis-pending">${question ? '暂未获得回答。' : '原文已按意群保存。可以针对这一段提问，或复制课堂上下文。'}</p>`;
+    return html;
+  }
+
+  function renderAISettingsStatus(settings = state.snapshot?.ai_settings || state.aiSettings) {
+    if (!settings) return;
+    state.aiSettings = settings;
+    const active = [providerLabel(settings.active_provider || settings.provider), settings.active_model].filter(Boolean).join(' / ');
+    $('#ai-active-settings').textContent = `当前生效：${active}${settings.pending ? '。新配置已保存，等待当前请求结束后切换。' : ''}`;
+    $('#ai-active-settings').classList.toggle('pending', Boolean(settings.pending));
+    $('#ai-key-status').textContent = settings.key_configured ? settings.key_persisted ? '已有密钥，已在本机保存。同一接口地址下留空不会覆盖。' : '已有密钥，仅本次服务运行有效。同一接口地址下留空不会覆盖。' : '尚未配置密钥。密钥不会回显，也不会保存到浏览器。';
+    $('#ai-storage-help').textContent = settings.storage_available === false ? '本机安全存储不可用，密钥只能在本次服务运行期间使用。' : '不勾选时仅本次服务运行使用，关闭服务后需要重新输入；勾选后由本机服务安全保存。';
+  }
+
+  function renderAIUsage() {
+    const usage = state.snapshot?.ai_usage;
+    const requests = tokenCount(usage?.requests) || 0;
+    const unknown = tokenCount(usage?.unknown) || 0;
+    const reported = tokenCount(usage?.usage_reported_requests) || 0;
+    const parts = [`本课 API：${requests ? `${requests} 次请求` : '尚无请求'}`];
+    if (requests) {
+      parts.push(`完成 ${tokenCount(usage.completed) || 0} / 失败 ${tokenCount(usage.failed) || 0}`);
+      if (unknown) parts.push(`结果未知 ${unknown}（可能已计费）`);
+      parts.push(reported ? `${usageText(usage)} · ${reported} 次已返回用量` : '令牌用量未返回');
+    }
+    $('#ai-usage').textContent = parts.join(' · ');
+    $('#ai-usage').title = '仅统计当前课堂的 API 请求，不含 Codex 和测试连接。令牌数由服务商返回，不代表实际费用；未返回的用量不计为零。';
+  }
+
+  function updateAIFormControls() {
+    const apiMode = $('#ai-provider').value === 'api';
+    const busy = state.aiSettingsBusy;
+    $('#ai-api-fields').hidden = !apiMode;
+    $('#ai-codex-help').hidden = apiMode;
+    for (const selector of ['#ai-provider', '#ai-test-button', '#ai-save-button']) $(selector).disabled = busy;
+    for (const selector of ['#ai-base-url', '#ai-model', '#ai-clear-key']) $(selector).disabled = busy || !apiMode;
+    $('#ai-remember-key').disabled = busy || !apiMode || state.aiSettings?.storage_available === false;
+    $('#ai-key').disabled = busy || !apiMode || $('#ai-clear-key').checked;
+    $('#ai-base-url').required = apiMode;
+    $('#ai-model').required = apiMode;
+    $('#ai-save-button').textContent = busy ? '请稍候…' : '保存设置';
+    $('#ai-test-button').textContent = apiMode ? '测试连接' : '检查登录';
+    $('#ai-settings-form').setAttribute('aria-busy', String(busy));
+  }
+
+  function fillAIForm(settings) {
+    // Only non-sensitive fields may be restored from the service. Never fill a password.
+    renderAISettingsStatus(settings);
+    $('#ai-provider').value = settings.provider === 'api' ? 'api' : 'codex';
+    $('#ai-base-url').value = settings.base_url || '';
+    $('#ai-model').value = settings.model || '';
+    $('#ai-key').value = '';
+    $('#ai-remember-key').checked = settings.storage_available !== false && settings.remember_key === true;
+    $('#ai-clear-key').checked = false;
+    updateAIFormControls();
+  }
+
+  function readAIForm() {
+    const apiMode = $('#ai-provider').value === 'api';
+    if (!apiMode) return { provider: 'codex' };
+    const body = { provider: 'api', base_url: $('#ai-base-url').value.trim(), model: $('#ai-model').value.trim(), remember_key: $('#ai-remember-key').checked && state.aiSettings?.storage_available !== false, clear_key: $('#ai-clear-key').checked };
+    if (apiMode && !body.clear_key && $('#ai-key').value.trim()) body.api_key = $('#ai-key').value.trim();
+    return body;
+  }
+
+  function showAISettingsResult(message, error = false) {
+    $('#ai-settings-result').textContent = message;
+    $('#ai-settings-result').hidden = !message;
+    $('#ai-settings-result').classList.toggle('error', error);
+  }
+
+  async function openAISettings() {
+    if (state.aiSettingsBusy) return;
+    $('#ai-key').value = '';
+    showAISettingsResult('正在读取配置…');
+    $('#ai-settings-dialog').showModal();
+    state.aiSettingsBusy = true; updateAIFormControls();
+    try {
+      const settings = await api('/api/ai/settings');
+      if (state.snapshot) state.snapshot.ai_settings = settings;
+      fillAIForm(settings);
+      showAISettingsResult('');
+    } catch (error) { showAISettingsResult(error.message, true); }
+    finally { state.aiSettingsBusy = false; updateAIFormControls(); }
+  }
+
+  async function submitAISettings(testOnly = false) {
+    if (state.aiSettingsBusy) return;
+    if (!$('#ai-settings-form').reportValidity()) return;
+    const body = readAIForm();
+    if (testOnly && body.clear_key) { showAISettingsResult('已选择清除密钥，无法测试。取消勾选后可使用已有或新密钥测试。', true); return; }
+    state.aiSettingsBusy = true; updateAIFormControls();
+    showAISettingsResult(testOnly ? body.provider === 'api' ? '正在测试当前配置；配置尚未保存…' : '正在检查本机 Codex 登录…' : '正在保存设置…');
+    const safeMessage = (value) => body.api_key ? String(value).split(body.api_key).join('[密钥已隐藏]') : String(value);
+    try {
+      // Flush a previously edited auto-analysis toggle before the backend applies
+      // API defaults, so a delayed course save cannot silently turn it back on.
+      if (!testOnly) await saveSettings();
+      const result = await api(testOnly ? '/api/ai/test' : '/api/ai/settings', { method: testOnly ? 'POST' : 'PUT', body, timeout: testOnly ? 180000 : 30000 });
+      if (testOnly) {
+        const label = `${providerLabel(result.provider || body.provider)}${result.model ? ` / ${result.model}` : ''}`;
+        const apiMode = (result.provider || body.provider) === 'api';
+        showAISettingsResult(safeMessage(`${result.ok ? apiMode ? '连接成功' : '登录检查通过' : apiMode ? '连接未通过' : '登录检查未通过'} · ${label}${apiMode ? ` · 测试用量：${usageText(result.usage)}` : ''}。${result.message || ''} 配置尚未保存。`), !result.ok);
+      } else {
+        const settings = result.settings || result;
+        if (state.snapshot) state.snapshot.ai_settings = settings;
+        fillAIForm(settings);
+        showAISettingsResult(settings.pending ? '设置已保存，当前请求完成后切换。课堂收音和转写可以继续。' : '设置已保存。');
+        await poll(true);
+      }
+    } catch (error) { showAISettingsResult(safeMessage(error.message), true); }
+    finally { state.aiSettingsBusy = false; updateAIFormControls(); }
+  }
+
   function render() {
     if (!state.session) return;
     const session = state.session;
@@ -156,15 +302,17 @@
       const analysis = group.analysis || group.summary;
       const pending = isPending(group.status);
       const error = group.error;
-      let content = analysis ? `<div class="analysis-content">${markdown(analysis)}</div>` : error ? `<p class="analysis-error">${escapeHTML(error)}</p>` : `<p class="analysis-pending">${pending ? '已加入处理队列，完成后会显示在这里。你可以继续听课。' : '原文已按意群保存。可以针对这一段提问，或复制给 Codex。'}</p>`;
+      let content = renderAIResponse(group, analysis);
       if (group.partial) content = '<p class="review-note">阶段整理：老师可能仍在继续讲解。</p>' + content;
       const retry = (group.stale && !pending || ['saved', 'error', 'failed', 'disabled', 'skipped'].includes(group.status)) && !isDemo() ? `<button class="text-button" data-retry-group="${escapeHTML(group.id)}">${group.stale ? '重新分析' : error ? '重试分析' : '分析本段'}</button>` : '';
       return `<article class="group-card${state.selectedGroup === group.id ? ' selected' : ''}" id="group-${escapeHTML(group.id)}"><div class="group-topline"><strong>意群 ${String(index + 1).padStart(2, '0')}</strong><div class="group-meta"><span class="timecode">${timecode(group.start)}</span><span class="group-state ${escapeHTML(group.status || '')}">${escapeHTML(statusLabel(group.status))}</span></div></div>${group.stale ? `<p class="stale-note">${escapeHTML(group.stale_reason || '原文已修改，以下解释可能需要更新。')} 可点击「重新分析」。</p>` : ''}<blockquote class="group-source">${escapeHTML(source)}</blockquote>${content}<div class="group-bottom"><span>${escapeHTML(group.id)} · ${(group.segment_ids || []).length} 段原文</span><span class="group-actions">${retry}<button class="text-button" data-group="${escapeHTML(group.id)}">基于本段提问 ↗</button></span></div></article>`;
     }).join('');
     replaceList('#groups-list', groupsHTML || emptyGroups, `${session.id}:${state.focusMode}:${state.selectedGroup}:${JSON.stringify(groups)}:${JSON.stringify(segments.map((segment) => [segment.id, segment.text]))}`);
-    const questionsHTML = questions.map((question) => `<article class="question-block"><p class="user-question">${escapeHTML(question.question)}</p><div class="answer-label">${isDemo() ? '示例回答 · 非 AI 实时生成' : 'CODEX · 随堂解答'}${question.group_id ? ` · ${escapeHTML(question.group_id)}` : ''}</div>${question.stale ? `<p class="stale-note">本次问答基于提问时的原文，之后相关内容已有修改。${question.answer ? '原回答保留供对照。' : ''}${question.stale_reason ? ` ${escapeHTML(question.stale_reason)}` : ''}</p>` : ''}<div class="question-answer">${question.answer ? `<div class="analysis-content">${markdown(question.answer)}</div>` : question.error ? `<p class="analysis-error">${escapeHTML(question.error)}</p><button class="text-button" data-retry-question="${escapeHTML(question.id)}">重试回答</button>` : `<p class="analysis-pending">${isPending(question.status) ? '正在等待 Codex 解答，你可以继续提问…' : '暂未获得回答。'}</p>`}</div></article>`).join('');
+    const questionsHTML = questions.map((question) => `<article class="question-block"><p class="user-question">${escapeHTML(question.question)}</p><div class="answer-label">${isDemo() ? '示例回答 · 非 AI 实时生成' : 'AI · 随堂解答'}${question.group_id ? ` · ${escapeHTML(question.group_id)}` : ''}</div>${question.stale ? `<p class="stale-note">本次问答基于提问时的原文，之后相关内容已有修改。${question.answer ? '原回答保留供对照。' : ''}${question.stale_reason ? ` ${escapeHTML(question.stale_reason)}` : ''}</p>` : ''}<div class="question-answer">${renderAIResponse(question, question.answer, true)}${!isPending(question.status) && (question.error || question.stream_status === 'interrupted') && !isDemo() ? `<button class="text-button" data-retry-question="${escapeHTML(question.id)}">重试回答</button>` : ''}</div></article>`).join('');
     replaceList('#questions-list', questionsHTML || emptyQuestions, `${session.id}:${JSON.stringify(questions)}`);
     renderEngineStatus();
+    renderAISettingsStatus();
+    renderAIUsage();
     renderQueue();
     renderCapture();
     renderCourseTools();
@@ -176,17 +324,19 @@
 
   function renderEngineStatus() {
     const statuses = state.snapshot?.status || {};
-    for (const [key, label] of [['asr', '本机转写'], ['codex', 'Codex']]) {
-      const info = statuses[key] || {};
-      const ready = info.ready === true || info.available === true || info.authenticated === true || info.logged_in === true || ['ready', 'connected', 'authenticated', 'ok'].includes(info.status);
+    const aiSettings = state.snapshot?.ai_settings || state.aiSettings || {};
+    for (const [key, label] of [['asr', '本机转写'], ['ai', providerLabel(statuses.ai?.provider || aiSettings.active_provider || aiSettings.provider || 'codex')]]) {
+      const info = statuses[key] || (key === 'ai' ? statuses.codex : null) || {};
+      const apiMode = key === 'ai' && (info.provider || aiSettings.active_provider || aiSettings.provider) === 'api';
+      const ready = info.ready === true || info.available === true || info.authenticated === true || info.logged_in === true || info.configured === true || ['ready', 'connected', 'authenticated', 'ok'].includes(info.status);
       const error = info.error || info.last_error || info.status === 'error' || info.status === 'unavailable';
-      const element = $(`#${key}-status`);
+      const element = $(`#${key === 'ai' ? 'codex' : key}-status`);
       const detail = info.message || info.detail || info.error || info.last_error || info.warning || '';
-      const model = key === 'asr' ? info.active_model_name || info.model_name || info.model : '';
+      const model = key === 'asr' ? info.active_model_name || info.model_name || info.model : info.model || aiSettings.active_model;
       const device = info.active_device || info.device;
-      const stateText = key === 'codex' ? info.inference_verified ? '调用已验证' : info.logged_in ? '已登录 · 待验证调用' : info.installed === false ? '未安装' : '待登录' : ready ? `可用 · ${(device || '本机').toUpperCase()}` : error ? '需检查' : info.loading || info.status === 'loading' ? '准备中' : '待就绪';
+      const stateText = key === 'ai' ? info.busy ? '正在生成' : error ? '需检查' : info.inference_verified ? '调用已验证' : apiMode ? info.configured ? '已配置 · 待验证调用' : '待配置' : info.logged_in ? '已登录 · 待验证调用' : info.installed === false ? '未安装' : '待登录' : ready ? `可用 · ${(device || '本机').toUpperCase()}` : error ? '需检查' : info.loading || info.status === 'loading' ? '准备中' : '待就绪';
       element.textContent = `${label} · ${stateText}${model ? ` / ${model}` : ''}`;
-      element.title = [detail, device && `运行设备：${device}`, info.pending_switch && '模式请求已保存，将在下一段音频切换。', key === 'codex' && info.logged_in === false && '请在启动终端运行 codex login', info.last_elapsed != null && `最近一段转写耗时：${Number(info.last_elapsed).toFixed(1)} 秒`, info.last_inference_seconds != null && `最近一次 Codex 耗时：${Number(info.last_inference_seconds).toFixed(1)} 秒`].filter(Boolean).join('\n');
+      element.title = [detail, device && `运行设备：${device}`, info.pending_switch && '模式请求已保存，将在下一段音频切换。', key === 'ai' && aiSettings.pending && '新配置已保存，等待当前请求结束后切换。', key === 'ai' && !apiMode && info.logged_in === false && '请在启动终端运行 codex login', info.last_elapsed != null && `最近一段转写耗时：${Number(info.last_elapsed).toFixed(1)} 秒`, info.last_inference_seconds != null && `最近一次 AI 耗时：${Number(info.last_inference_seconds).toFixed(1)} 秒`].filter(Boolean).join('\n');
       element.className = `status-pill ${error ? 'error' : ready ? 'ready' : 'warning'}`;
     }
     const jobs = state.snapshot?.jobs || [];
@@ -195,10 +345,10 @@
     $('#ai-queue').textContent = aiJobs ? `AI 待处理 ${aiJobs}` : '';
     const pending = [];
     if (audioJobs) pending.push(`本机转写 ${audioJobs} 项`);
-    if (aiJobs) pending.push(`Codex ${aiJobs} 项`);
+    if (aiJobs) pending.push(`AI ${aiJobs} 项`);
     const lag = Number(state.snapshot?.queue?.lag_seconds) || 0;
     if (lag > 0) pending.push(`转写落后约 ${Math.ceil(lag)} 秒`);
-    $('#processing-status').textContent = pending.length ? `${pending.join(' · ')}，完成后自动显示` : '音频 → 本机转写 → 意群 → Codex';
+    $('#processing-status').textContent = pending.length ? `${pending.join(' · ')}，完成后自动显示` : '音频 → 本机转写 → 意群 → AI';
     const errors = jobs.filter((job) => ['error', 'failed'].includes(job.status));
     if (errors.length && !pending.length) $('#processing-status').textContent = `${errors.length} 项处理失败，可在对应记录中重试`;
     if (errors.length) $('#processing-status').title = errors.map((job) => `${job.kind}: ${job.error || '未知错误'}`).join('\n');
@@ -220,8 +370,9 @@
     $('#actual-mode').title = `请求模式：${modes[asr.requested_mode] || '自动'}。${asr.warning || ''}`;
     const ai = state.snapshot?.ai || {};
     $('#ai-recovery').hidden = !ai.paused;
-    $('#ai-pause-title').textContent = ({ network: '网络不可用，AI 已暂停', quota: '额度不足，AI 已暂停', auth: '需要重新登录 Codex', timeout: 'AI 响应超时，已暂停' })[ai.kind] || 'AI 已暂停';
-    $('#ai-pause-reason').textContent = ai.reason || '尚未分析的课堂内容和问题已保留。';
+    $('#ai-pause-title').textContent = ({ network: '网络不可用，AI 已暂停', quota: '额度不足，AI 已暂停', auth: 'AI 认证需要检查', timeout: 'AI 响应超时，已暂停' })[ai.kind] || 'AI 已暂停';
+    $('#ai-pause-reason').textContent = `${ai.reason || '尚未分析的课堂内容和问题已保留。'}${aiSettings.pending ? ' 请等待当前请求结束、接入切换完成后再恢复。' : ''}`;
+    document.querySelectorAll('[data-ai-resume]').forEach((button) => { button.disabled = state.aiResuming || Boolean(aiSettings.pending); });
   }
 
   function renderAnalysisMode() {
@@ -252,7 +403,7 @@
       $('#glossary-title').textContent = `${selected.name} · 术语与大纲`;
       const pending = isPending(selected.status);
       $('#generate-glossary').disabled = pending || state.glossarySubmitting;
-      $('#glossary-status').textContent = selected.error ? `生成未完成：${selected.error}` : pending ? 'Codex 正在生成术语，可以关闭窗口继续听课。' : selected.glossary?.length ? `已保存 ${selected.glossary.length} 个术语${selected.generated_at ? ` · ${new Date(selected.generated_at).toLocaleString('zh-CN')}` : ''}` : '尚无术语表。点击生成后会使用现有 Codex 账号。';
+      $('#glossary-status').textContent = selected.error ? `生成未完成：${selected.error}` : pending ? 'AI 正在生成术语，可以关闭窗口继续听课。' : selected.glossary?.length ? `已保存 ${selected.glossary.length} 个术语${selected.generated_at ? ` · ${new Date(selected.generated_at).toLocaleString('zh-CN')}` : ''}` : '尚无术语表。点击生成后会使用当前 AI 接入。';
       const glossaryKey = JSON.stringify(selected.glossary || []);
       if (state.renderKeys.glossary !== glossaryKey) {
         $('#glossary-content').innerHTML = Array.isArray(selected.glossary) && selected.glossary.length ? `<table class="glossary-table"><thead><tr><th>英文术语</th><th>中文释义</th><th>缩写 / 别名</th></tr></thead><tbody>${selected.glossary.map((term) => `<tr><td>${escapeHTML(term.term || '')}</td><td>${escapeHTML(term.meaning || '')}</td><td>${escapeHTML(Array.isArray(term.aliases) ? term.aliases.join('、') : term.aliases || '')}</td></tr>`).join('')}</tbody></table>` : '';
@@ -848,7 +999,15 @@
     await poll(true);
   });
   for (const selector of ['#course-title', '#course-terms']) $(selector).addEventListener('input', markSettingsDirty);
-  $('#auto-analyze').addEventListener('change', () => { markSettingsDirty(); renderAnalysisMode(); if ($('#auto-analyze').checked) toast('逐段解释已开启。新的意群文字将发送至 Codex。'); });
+  $('#auto-analyze').addEventListener('change', () => { markSettingsDirty(); renderAnalysisMode(); if ($('#auto-analyze').checked) toast('逐段解释已开启。新的意群文字将发送至所选 AI 服务；API 模式会产生用量。'); });
+
+  $('#ai-settings-button').addEventListener('click', openAISettings);
+  $('#ai-provider').addEventListener('change', updateAIFormControls);
+  $('#ai-clear-key').addEventListener('change', () => { if ($('#ai-clear-key').checked) $('#ai-key').value = ''; updateAIFormControls(); });
+  $('#ai-settings-form').addEventListener('submit', (event) => { event.preventDefault(); return submitAISettings(); });
+  $('#ai-test-button').addEventListener('click', () => submitAISettings(true));
+  $('#ai-settings-dialog').addEventListener('close', () => { $('#ai-key').value = ''; $('#ai-clear-key').checked = false; });
+  $('#ai-settings-dialog').addEventListener('cancel', () => { $('#ai-key').value = ''; $('#ai-clear-key').checked = false; });
 
   $('#runtime-mode').addEventListener('change', async () => {
     state.modeSaving = true;
@@ -920,7 +1079,7 @@
     try {
       await api(`/api/courses/${encodeURIComponent(state.glossaryCourseId)}/glossary`, { method: 'POST', body: { syllabus: $('#course-syllabus').value.trim() } });
       await poll(true);
-      toast('术语生成已加入 Codex 队列，完成后会保存到课程预设。');
+      toast('术语生成已加入 AI 队列，完成后会保存到课程预设。');
     } catch (error) { toast(error.message, true); }
     finally { state.glossarySubmitting = false; renderCourseTools(); }
   });
@@ -1007,14 +1166,15 @@
     finally { button.disabled = false; }
   });
   document.querySelectorAll('[data-ai-resume]').forEach((button) => button.addEventListener('click', async () => {
-    const buttons = [...document.querySelectorAll('[data-ai-resume]')];
-    buttons.forEach((item) => { item.disabled = true; });
+    if (state.aiResuming || (state.snapshot?.ai_settings || state.aiSettings)?.pending) return;
+    state.aiResuming = true;
+    renderEngineStatus();
     try {
       await api('/api/ai/resume', { method: 'POST', body: { strategy: button.dataset.aiResume } });
       await poll(true);
       toast(button.dataset.aiResume === 'backfill' ? '已请求补分析未完成的内容。' : '已请求从最新内容继续分析。历史原文仍然保留。');
     } catch (error) { toast(error.message, true); }
-    finally { buttons.forEach((item) => { item.disabled = false; }); }
+    finally { state.aiResuming = false; renderEngineStatus(); }
   }));
 
   $('#session-select').addEventListener('change', async (event) => {
@@ -1133,7 +1293,7 @@
       await saveSettings();
       await api(`/api/${type}/${encodeURIComponent(id)}/retry`, { method: 'POST', body: { session_id: state.session.id } });
       await poll(true);
-      toast(type === 'audio' ? '已加入本机转写队列。' : '已加入 Codex 处理队列。');
+      toast(type === 'audio' ? '已加入本机转写队列。' : '已加入 AI 处理队列。');
     } catch (error) { toast(error.message, true); }
     finally { button.disabled = false; }
   });

@@ -18,12 +18,15 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from asr import ASREngine
-from codex_bridge import CodexBridge
+from codex_bridge import CodexBridge, CodexBridgeError
+from ai_settings import AISettings, empty_usage, record_usage
+from version import __version__
 from classroom_features import ClassroomFeatures, wav_duration
 from course_catalog import glossary_terms, validate_glossary
 
@@ -96,6 +99,10 @@ class Classroom(ClassroomFeatures):
         self.lock = threading.RLock()
         self.engine = engine or ASREngine(self.config)
         self.bridge = bridge or CodexBridge(self.config, data / "ai-work")
+        self.connection = AISettings(data, self.config)
+        self.active_ai = None
+        self.ai_switch_pending = False
+        self.api_last_status = {}
         self.sessions: dict[str, dict] = {}
         self.jobs: dict[str, dict] = {}
         self.audio_queue: queue.Queue = queue.Queue()
@@ -115,10 +122,18 @@ class Classroom(ClassroomFeatures):
                 s.setdefault("settings", {"terms": "", "auto_analyze": True})
                 s.setdefault("pending_ids", [])
                 s.setdefault("flush_requested", False)
+                s.setdefault("ai_usage", empty_usage())
+                usage = s["ai_usage"]
+                usage.setdefault("unknown", 0)
+                # An attempt saved before submission may have reached the
+                # provider even when this process never received its result.
+                usage["unknown"] += max(0, usage["requests"] - usage["completed"] - usage["failed"] - usage["unknown"])
                 # Interrupted AI work is not silently represented as completed.
                 for item in s["groups"] + s["questions"] + s["revisions"]:
                     if item.get("status") in ("pending", "running"):
                         item.update(status="error", error="上次运行中断，可重试这一项。")
+                    if item.get("stream_status") == "streaming":
+                        item["stream_status"] = "interrupted"
                 self.sessions[s["id"]] = s
             except (OSError, ValueError, TypeError):
                 self.warnings.append(f"有一份历史课程文件无法读取，原文件已保留：{path.parent.name}")
@@ -160,7 +175,8 @@ class Classroom(ClassroomFeatures):
             sid = uuid.uuid4().hex
             s = {"id": sid, "title": title[:160] or "新的课堂", "created_at": stamp(),
                  "demo": demo, "segments": [], "groups": [], "questions": [], "audio": [], "revisions": [], "course_id": None,
-                 "settings": {"terms": "", "auto_analyze": not demo}, "pending_ids": [],
+                 "settings": {"terms": "", "auto_analyze": not demo and self.connection.values["provider"] != "api"}, "pending_ids": [],
+                 "ai_usage": empty_usage(),
                  "flush_requested": False, "last_text_at": 0}
             self.sessions[sid] = s
             self.current = sid
@@ -170,7 +186,10 @@ class Classroom(ClassroomFeatures):
     def state(self):
         # Hardware status can take the ASR lock; do not hold the session lock while reading it.
         asr_status = self.engine.status()
-        codex_status = self.bridge.status()
+        with self.lock:
+            provider = self.connection.values["provider"]
+            active = copy.deepcopy(self.active_ai)
+        codex_status = self.bridge.status() if provider == "codex" or (active and active["provider"] == "codex") else {}
         with self.lock:
             active = self.get()
             remaining = [a for a in active["audio"] if a.get("status") in ("pending", "running")]
@@ -180,12 +199,87 @@ class Classroom(ClassroomFeatures):
             return {"session": copy.deepcopy(active),
                     "courses": copy.deepcopy(self.courses), "ai": copy.deepcopy(self.ai), "soundcheck": soundcheck,
                     "sessions": [{k: s[k] for k in ("id", "title", "created_at", "demo")} for s in sorted(self.sessions.values(), key=lambda x: x["created_at"], reverse=True)],
-                    "status": {"asr": asr_status, "codex": codex_status},
+                    "status": {"asr": asr_status, "codex": codex_status, "ai": self.ai_status(codex_status)},
+                    "version": __version__, "ai_settings": self.ai_settings(),
+                    "ai_usage": copy.deepcopy(active.get("ai_usage", empty_usage())),
                     "jobs": [copy.deepcopy(j) for j in list(self.jobs.values())[-120:] if j["session_id"] == active["id"]],
                     "queue": {"audio": sum(j["kind"] == "audio" and j["status"] in ("pending", "running") for j in self.jobs.values()),
                               "ai": sum(j["kind"] in ("question", "analysis", "glossary") and j["status"] in ("pending", "running", "paused") for j in self.jobs.values()),
                               "lag_seconds": round(lag, 1)},
                     "warnings": self.warnings}
+
+    def ai_settings(self):
+        with self.lock:
+            values = self.connection.public()
+            current = self.active_ai or {"provider": values["provider"], "model": values["model"] if values["provider"] == "api" else self.config.get("codex_model")}
+            return {**values, "pending": self.ai_switch_pending,
+                    "active_provider": current["provider"], "active_model": current.get("model")}
+
+    def ai_status(self, codex_status=None):
+        values = self.ai_settings()
+        if values["active_provider"] == "codex":
+            status = dict(codex_status or {})
+            configured = bool(status.get("installed") and status.get("logged_in"))
+        else:
+            status = dict(self.api_last_status)
+            configured = bool(values["key_configured"] and values["model"])
+        return {**status, "provider": values["active_provider"], "model": values["active_model"],
+                "configured": configured, "busy": self.active_ai is not None,
+                "pending": values["pending"]}
+
+    def configure_ai(self, payload):
+        with self.lock:
+            try:
+                desired, key = self.connection.prepare(payload)
+                routing_changed = any(desired[k] != self.connection.values[k] for k in ("provider", "base_url", "model")) or key != self.connection.key
+                if routing_changed:
+                    has_waiting = any(j["kind"] in ("question", "analysis", "glossary") and j["status"] in ("pending", "paused", "running") for j in self.jobs.values())
+                    keep_paused = bool(self.active_ai or has_waiting or self.ai["paused"])
+                    self.ai_switch_pending = self.active_ai is not None
+                    # Freeze before ANY routing/default persistence. Even a
+                    # full disk must never move queued work to a new provider.
+                    self._pause_ai("switch", "AI 接入设置正在切换。当前请求完成后，请选择补分析或从最新继续。")
+                    if desired["provider"] == "api":
+                        for session in self.sessions.values():
+                            session["settings"]["auto_analyze"] = False
+                        for session in self.sessions.values():
+                            self.save(session)
+                self.connection.save(payload)
+                if routing_changed:
+                    self.api_last_status = {}
+                    if not keep_paused:
+                        resumed = {**self.ai, "paused": False, "kind": None, "reason": None}
+                        atomic_json(self.data / "ai-state.json", resumed)
+                        self.ai.update(resumed)
+                        self.ai_ready.set()
+            except CodexBridgeError as exc:
+                raise HTTPException(400, str(exc)) from None
+            except OSError:
+                raise HTTPException(507, "本机存储写入失败，设置保存未完成；AI 队列保持暂停，请检查存储后重新保存或恢复原接入。") from None
+            return self.ai_settings()
+
+    def test_ai(self, payload):
+        # Explicit user action only. Do not save draft settings or submit a
+        # classroom transcript, and never silently retry a billable request.
+        with self.lock:
+            provider = payload.get("provider", self.connection.values["provider"])
+            if provider == "codex":
+                bridge = None
+            else:
+                try:
+                    bridge = self.connection.api_bridge(payload=payload)
+                except CodexBridgeError as exc:
+                    raise HTTPException(400, str(exc)) from None
+        if bridge is None:
+            status = self.bridge.status()
+            ok = bool(status.get("installed") and status.get("logged_in"))
+            return {"ok": ok, "provider": "codex", "model": self.config.get("codex_model"),
+                    "usage": None, "message": "已检测到本地 Codex 登录；未提交 AI 请求。" if ok else "请先安装并登录本地 Codex。"}
+        try:
+            result = bridge.test_connection()
+            return {**result, "provider": "api", "message": "API 测试成功；本次仅发送简短测试文字。"}
+        except CodexBridgeError as exc:
+            raise HTTPException(400, str(exc)) from None
 
     def job(self, sid, kind):
         job = {"id": uuid.uuid4().hex, "session_id": sid, "kind": kind, "status": "pending", "created_at": stamp()}
@@ -366,10 +460,14 @@ class Classroom(ClassroomFeatures):
         if item.get("job_id") in self.jobs and self.jobs[item["job_id"]]["status"] in ("pending", "paused"):
             self.jobs[item["job_id"]]["status"] = "superseded"
         job = self.job(s["id"], kind)
+        if kind == "glossary":
+            item["ai_session_id"] = s["id"]
         item.update(status="pending", job_id=job["id"])
         if kind == "analysis":
             item["automatic"] = automatic
         item.pop("error", None)
+        item.pop("streaming_text", None)
+        item.pop("stream_status", None)
         if self.ai["paused"]:
             item["status"] = job["status"] = "paused"
             return job
@@ -450,6 +548,14 @@ class Classroom(ClassroomFeatures):
                     self.ai_queue.task_done()
                     continue
                 item["status"] = self.jobs[jid]["status"] = "running"
+                provider = self.connection.values["provider"]
+                model = self.connection.values["model"] if provider == "api" else self.config.get("codex_model")
+                self.active_ai = {"provider": provider, "model": model}
+                item.update(stream_provider=provider, stream_model=model)
+                if provider == "api" and kind != "glossary":
+                    item.update(streaming_text="", stream_status="streaming")
+                api_config = dict(self.connection.values)
+                api_key = self.connection.key
                 version = item.get("version", 0)
                 raw = ""
                 if kind == "analysis":
@@ -476,15 +582,49 @@ class Classroom(ClassroomFeatures):
                 history = item.get("history_snapshot", [])
                 self.save(s)
             began = time.monotonic()
-            try:
-                if kind == "analysis":
-                    result = self.bridge.analyze(context, raw)
-                elif kind == "glossary":
-                    result = validate_glossary(self.bridge.generate_glossary(glossary_name, syllabus))
-                else:
-                    result = self.bridge.ask(context, item["question"], history)
+            last_draft_save = [0.0]
+            request_bridge = self.bridge
+            success = False
+            api_attempt = False
+            usage_recorded = False
+            metadata = {"provider": provider, "model": model, "usage": None}
+
+            def stream_delta(delta):
                 with self.lock:
+                    if item.get("job_id") != jid:
+                        return
+                    item["streaming_text"] = (item.get("streaming_text", "") + delta)[:120000]
+                    if time.monotonic() - last_draft_save[0] >= .5:
+                        self.save(s)
+                        last_draft_save[0] = time.monotonic()
+            try:
+                if provider == "api":
+                    # Snapshot destination and credential before releasing the
+                    # queue lock; changing settings cannot redirect this call.
+                    if not api_key or not model:
+                        raise CodexBridgeError("请在 AI 设置中填写 API 地址、模型和密钥。", kind="auth")
+                    request_bridge = self.connection.api_factory({**api_config, "timeout_seconds": self.connection.timeout}, api_key,
+                                                                 on_delta=stream_delta if kind != "glossary" else None)
+                    with self.lock:
+                        s["ai_usage"]["requests"] += 1
+                        api_attempt = True
+                        self.save(s)
+                if kind == "analysis":
+                    result = request_bridge.analyze(context, raw)
+                elif kind == "glossary":
+                    result = validate_glossary(request_bridge.generate_glossary(glossary_name, syllabus))
+                else:
+                    result = request_bridge.ask(context, item["question"], history)
+                if provider == "api":
+                    metadata = request_bridge.metadata()
+                success = True
+                with self.lock:
+                    if api_attempt:
+                        record_usage(s["ai_usage"], metadata, True)
+                        usage_recorded = True
                     item.update(status="done", elapsed=round(time.monotonic()-began, 2))
+                    item.update(ai_provider=provider, ai_model=metadata.get("model"), usage=metadata.get("usage"),
+                                stream_status="complete", streaming_text="")
                     if kind == "glossary":
                         item.update(status="ready", glossary=result, terms=glossary_terms(result), generated_at=stamp())
                     else:
@@ -494,15 +634,28 @@ class Classroom(ClassroomFeatures):
                     self.jobs[jid].update(status="done", elapsed=item["elapsed"])
             except Exception as exc:
                 with self.lock:
-                    error = str(exc)[:400] or "AI 暂时无法回答，可稍后重试。"
+                    if api_attempt and not usage_recorded:
+                        record_usage(s["ai_usage"], request_bridge.metadata(), False)
+                        usage_recorded = True
+                    error = str(exc)[:400] if isinstance(exc, CodexBridgeError) else "AI 暂时无法完成回答，请检查设置后重试。"
                     error_kind = getattr(exc, "kind", "other")
                     paused = error_kind in ("network", "quota", "auth", "timeout")
                     item.update(status="paused" if paused else "error", error=error, error_kind=error_kind)
+                    if provider == "api" and kind != "glossary":
+                        item["stream_status"] = "interrupted"
                     self.jobs[jid].update(status=item["status"], error=error)
                     if paused:
                         self._pause_ai(error_kind, error)
             finally:
                 with self.lock:
+                    if api_attempt and not usage_recorded:
+                        record_usage(s["ai_usage"], request_bridge.metadata(), success)
+                    if provider == "api" and self.connection.values == api_config and self.connection.key == api_key:
+                        self.api_last_status = {"inference_verified": success, "last_inference_seconds": round(time.monotonic() - began, 2),
+                                                "last_error": None if success else item.get("error"),
+                                                "last_error_kind": None if success else item.get("error_kind")}
+                    self.active_ai = None
+                    self.ai_switch_pending = False
                     self.save(s)
                     if kind == "glossary":
                         self.save_courses()
@@ -540,6 +693,7 @@ class Classroom(ClassroomFeatures):
         lines += ["## 意群与解释", ""]
         for group in s["groups"]:
             lines += [f"### {group['id']} · {', '.join(group['segment_ids'])}", "", group["text"], "", group.get("analysis") or group.get("error") or "尚未分析。", ""]
+            lines += self.ai_export_lines(group)
             if group.get("stale"):
                 lines += ["待核对：" + (group.get("stale_reason") or "依据已变化，请重新分析。"), ""]
             if group.get("partial"):
@@ -547,6 +701,7 @@ class Classroom(ClassroomFeatures):
         lines += ["## 课堂提问", ""]
         for q in s["questions"]:
             lines += [f"### {q['question']}", "", q.get("answer") or q.get("error") or "尚未回答。", ""]
+            lines += self.ai_export_lines(q)
             if q.get("stale"):
                 lines += [q.get("stale_reason") or "回答依据后来有修改，请核对。", ""]
         for index, revision in enumerate(s.get("revisions", []), 1):
@@ -555,7 +710,22 @@ class Classroom(ClassroomFeatures):
                 lines += [source_line(seg), ""]
             if revision.get("error"):
                 lines += [revision["error"], ""]
+        usage = s.get("ai_usage", {})
+        if usage.get("requests"):
+            lines += ["## API 用量", "", f"请求 {usage['requests']} 次；成功 {usage.get('completed', 0)} 次；失败 {usage.get('failed', 0)} 次。",
+                      f"中断后结果未知 {usage.get('unknown', 0)} 次（可能已计费）。",
+                      f"其中 {usage.get('usage_reported_requests', 0)} 次返回 token 用量，已报告总量 {usage.get('total_tokens', 0)}；未返回的部分未知，实际费用以服务商账单为准。", ""]
         return "\n".join(lines)
+
+    @staticmethod
+    def ai_export_lines(item):
+        lines = []
+        if item.get("ai_provider"):
+            lines += [f"正式结果接入：{item['ai_provider']}；模型：{item.get('ai_model') or '由本地 Codex 选择'}。", ""]
+        if item.get("streaming_text") and item.get("stream_status") in ("streaming", "interrupted"):
+            lines += [f"未完成草稿（尚未校验，不作为正式答案；接入 {item.get('stream_provider', 'api')}，模型 {item.get('stream_model') or '未知'}）：",
+                      item["streaming_text"], ""]
+        return lines
 
 
 class Settings(BaseModel):
@@ -603,6 +773,15 @@ class ResumeInput(BaseModel):
     strategy: str
 
 
+class AISettingsInput(BaseModel):
+    provider: str | None = Field(default=None, max_length=20)
+    base_url: str | None = Field(default=None, max_length=2048)
+    model: str | None = Field(default=None, max_length=160)
+    api_key: str | None = Field(default=None, max_length=4096)
+    remember_key: bool | None = None
+    clear_key: bool = False
+
+
 def create_app(config=None, data=None, engine=None, bridge=None):
     if config is None:
         path = ROOT / "config.json"
@@ -617,8 +796,14 @@ def create_app(config=None, data=None, engine=None, bridge=None):
         yield
         room.stop()
 
-    app = FastAPI(title="课间 · Classroom", lifespan=lifespan)
+    app = FastAPI(title="课间 · Classroom", version=__version__, lifespan=lifespan)
     app.state.room = room
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_input(request, exc):
+        # Pydantic's default response can echo a credential supplied in an
+        # invalid field. Never reflect request bodies from the settings form.
+        return JSONResponse({"detail": "提交的数据格式无效，请检查输入。"}, status_code=422)
 
     @app.middleware("http")
     async def local_only(request, call_next):
@@ -641,7 +826,19 @@ def create_app(config=None, data=None, engine=None, bridge=None):
 
     @app.get("/api/health")
     def health():
-        return {"ok": True, "app": "classroom-assistant"}
+        return {"ok": True, "app": "classroom-assistant", "version": __version__}
+
+    @app.get("/api/ai/settings")
+    def ai_settings():
+        return room.ai_settings()
+
+    @app.put("/api/ai/settings")
+    def configure_ai(body: AISettingsInput):
+        return room.configure_ai(body.model_dump(exclude_none=True))
+
+    @app.post("/api/ai/test")
+    def test_ai(body: AISettingsInput):
+        return room.test_ai(body.model_dump(exclude_none=True))
 
     @app.post("/api/mode")
     def mode(body: ModeInput):

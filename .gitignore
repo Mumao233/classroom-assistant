@@ -2,6 +2,7 @@
 /data/
 /config.json
 /config.local.json
+*.dpapi
 .env
 .env.*
 !.env.example
