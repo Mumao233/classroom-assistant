@@ -68,7 +68,7 @@ class ClassroomFeatures:
             if not isinstance(self.courses, list) or any(not isinstance(c, dict) or not c.get("id") or not c.get("name") for c in self.courses):
                 raise ValueError("invalid courses")
             for course in self.courses:
-                if course.get("status") in ("pending", "running", "paused"):
+                if course.get("status") in ("pending", "running"):
                     course.update(status="error", error="上次术语生成中断，请重新生成。")
             if not target.exists():
                 self.save_courses()

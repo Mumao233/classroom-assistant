@@ -36,7 +36,7 @@ for (const match of html.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>/gi)
 }
 for (const match of source.matchAll(/\$\('(#[-\w]+)'\)/g)) assert.ok(elements.has(match[1]), `missing DOM node ${match[1]}`);
 assert.match(html, /id="ai-key" type="password" autocomplete="new-password"/);
-assert.match(html, /课间 1\.1\.0/);
+assert.match(html, /课间 1\.1\.1/);
 const aiButtons = ['backfill', 'latest'].map((strategy) => { const button = new Element('BUTTON'); button.dataset.aiResume = strategy; return button; });
 const closeButtons = [...html.matchAll(/data-close-dialog="([^"]+)"/g)].map((match) => { const button = new Element('BUTTON'); button.dataset.closeDialog = match[1]; return button; });
 const document = {
@@ -58,6 +58,7 @@ let testGate = null;
 let testFailure = null;
 let resumeGate = null;
 const server = {
+  input_limits: { text: 12000, question: 4000, syllabus: 12000 },
   session: { id: 'test-session', title: 'Synthetic class', settings: { terms: '', auto_analyze: false }, segments: [], groups: [], questions: [], audio: [], revisions: [] },
   sessions: [{ id: 'test-session', title: 'Synthetic class' }], courses: [], jobs: [], soundcheck: { status: 'idle' },
   status: { asr: { available: true, device: 'cpu', model_name: 'small', requested_mode: 'auto', effective_mode: 'battery', on_ac_power: false }, codex: { logged_in: true }, ai: { provider: 'codex', model: 'account-model', configured: true, logged_in: true, busy: false } },

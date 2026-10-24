@@ -26,6 +26,49 @@
   const statusLabel = (value) => ({ pending: '待处理', queued: '排队中', paused: '已暂停', running: '处理中', processing: '处理中', done: '已完成', completed: '已完成', error: '未完成', failed: '未完成', saved: '已归档', disabled: '未开启分析', skipped: '已略过', merged: '已合并' })[value] || '已归档';
   const isPending = (value) => ['pending', 'queued', 'running', 'processing'].includes(value);
   const isDemo = (session = state.session) => Boolean(session?.demo || session?.is_demo || session?.settings?.demo || session?.source === 'demo');
+  const textFields = [
+    { selector: '#manual-text', label: '手动原文', key: 'text', required: true },
+    { selector: '#edit-segment-text', label: '修改原文', key: 'text', required: true },
+    { selector: '#question-input', label: '提问', key: 'question', required: true },
+    { selector: '#course-syllabus', label: '课程大纲', key: 'syllabus', required: false },
+  ];
+  // Match Python str.isspace(), including NEL/control separators and excluding FEFF.
+  const blankText = (value) => /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/u.test(value);
+
+  function textFieldInfo(field) {
+    const value = $(field.selector).value;
+    const count = Array.from(value).length;
+    const configured = state.snapshot?.input_limits?.[field.key];
+    const limit = Number.isSafeInteger(configured) && configured > 0 ? configured : null;
+    let error = '';
+    if (!state.connected) error = '本地服务未连接，暂不能提交。请等待重新连接，草稿已保留。';
+    else if (limit === null) error = '尚未取得有效的输入上限，暂不能提交。请等待本地服务返回配置，草稿已保留。';
+    else if (count > limit) error = `上限 ${limit} 个 Unicode 码点，当前 ${count} 个；请缩短后提交，草稿已保留。`;
+    else if (field.required && blankText(value)) error = `不能只含空白；上限 ${limit} 个 Unicode 码点，当前 ${count} 个。`;
+    return { value, count, limit, error };
+  }
+
+  function renderInputLimits() {
+    for (const field of textFields) {
+      const { count, limit } = textFieldInfo(field);
+      const unavailable = !state.connected || limit === null;
+      const over = !unavailable && count > limit;
+      const bounds = unavailable ? `输入上限尚未就绪，当前 ${count} 个；连接本地服务后才能提交。` : `上限 ${limit} 个，当前 ${count} 个${over ? '；已超出上限，请缩短后提交' : ''}。`;
+      const note = `${field.label}：${bounds}按 Unicode 码点计数：中英文字一般 1 个，普通 emoji 1 个，组合 emoji 可能多个；空白计入。`;
+      const hint = $(`${field.selector}-limit`);
+      if (hint.textContent !== note) hint.textContent = note;
+      hint.classList.toggle('error', over);
+      $(field.selector).setAttribute('aria-invalid', String(over));
+    }
+  }
+
+  function validatedText(selector) {
+    const field = textFields.find((item) => item.selector === selector);
+    const { value, error } = textFieldInfo(field);
+    renderInputLimits();
+    if (error) { toast(`${field.label}：${error}`, true, 8000); $(selector).focus(); return null; }
+    return value;
+  }
 
   function toast(message, error = false, duration = 5000) {
     clearTimeout(state.toastTimer);
@@ -266,6 +309,7 @@
   }
 
   function render() {
+    renderInputLimits();
     if (!state.session) return;
     const session = state.session;
     const segments = session.segments || [];
@@ -540,6 +584,7 @@
       $('#connection-banner').hidden = false;
       $('#connection-dot').className = 'connection-dot error';
       $('#connection-label').textContent = '本地服务未连接';
+      renderInputLimits();
     } finally {
       state.pollRunning = false;
     }
@@ -1066,6 +1111,7 @@
     if (!course) return;
     state.glossaryCourseId = course.id;
     $('#course-syllabus').value = course.syllabus || '';
+    renderInputLimits();
     state.renderKeys.glossary = null;
     $('#glossary-dialog').showModal();
     renderCourseTools();
@@ -1073,11 +1119,13 @@
   $('#glossary-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     if (!state.glossaryCourseId || $('#generate-glossary').disabled) return;
+    const syllabus = validatedText('#course-syllabus');
+    if (syllabus === null) return;
     if (isDemo()) { toast('演示课堂不调用 AI。请先新建一节课，再生成术语。'); return; }
     state.glossarySubmitting = true;
     $('#generate-glossary').disabled = true;
     try {
-      await api(`/api/courses/${encodeURIComponent(state.glossaryCourseId)}/glossary`, { method: 'POST', body: { syllabus: $('#course-syllabus').value.trim() } });
+      await api(`/api/courses/${encodeURIComponent(state.glossaryCourseId)}/glossary`, { method: 'POST', body: { syllabus } });
       await poll(true);
       toast('术语生成已加入 AI 队列，完成后会保存到课程预设。');
     } catch (error) { toast(error.message, true); }
@@ -1092,6 +1140,7 @@
     if (!segment) return;
     state.editingSegment = { id: segment.id, sessionId: state.session.id };
     $('#edit-segment-text').value = segment.text || '';
+    renderInputLimits();
     $('#edit-original-text').textContent = segment.machine_text ?? segment.text ?? '';
     $('#edit-segment-dialog').showModal();
     $('#edit-segment-text').focus();
@@ -1099,8 +1148,9 @@
   $('#edit-segment-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const target = state.editingSegment;
-    const text = $('#edit-segment-text').value.trim();
-    if (!target || !text) return;
+    if (!target) return;
+    const text = validatedText('#edit-segment-text');
+    if (text === null) return;
     const button = event.submitter; button.disabled = true;
     try {
       await api(`/api/segments/${encodeURIComponent(target.id)}/edit`, { method: 'POST', body: { text, session_id: target.sessionId } });
@@ -1217,13 +1267,14 @@
 
   $('#text-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    const text = $('#manual-text').value.trim();
-    if (!text) return;
+    if ($('#add-text').disabled) return;
+    const text = validatedText('#manual-text');
+    if (text === null) return;
     $('#add-text').disabled = true;
     try {
       await ensureRealSession(); await saveSettings();
       await api('/api/text', { method: 'POST', body: { text, session_id: state.session.id } });
-      $('#manual-text').value = '';
+      if ($('#manual-text').value === text) $('#manual-text').value = '';
       await poll(true);
     } catch (error) { toast(error.message, true); }
     finally { $('#add-text').disabled = false; }
@@ -1261,7 +1312,7 @@
   $('#clear-context').addEventListener('click', () => { state.selectedGroup = null; $('#question-context').hidden = true; render(); });
   $('#questions-list').addEventListener('click', (event) => {
     const button = event.target.closest('[data-question]');
-    if (button) { $('#question-input').value = button.dataset.question; $('#question-input').focus(); }
+    if (button) { $('#question-input').value = button.dataset.question; renderInputLimits(); $('#question-input').focus(); }
   });
   $('#question-input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); $('#question-form').requestSubmit(); }
@@ -1269,14 +1320,14 @@
   $('#question-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     if ($('#ask-button').disabled) return;
-    const question = $('#question-input').value.trim();
-    if (!question) return;
+    const question = validatedText('#question-input');
+    if (question === null) return;
     if (isDemo()) { toast('演示模式不调用 AI。请新建课程并加入真实课堂原文后提问。'); return; }
     $('#ask-button').disabled = true;
     try {
       await saveSettings();
       await api('/api/ask', { method: 'POST', body: { question, ...(state.selectedGroup ? { group_id: state.selectedGroup } : {}) } });
-      $('#question-input').value = '';
+      if ($('#question-input').value === question) $('#question-input').value = '';
       await poll(true);
       $('#questions-list').scrollTop = $('#questions-list').scrollHeight;
     } catch (error) { toast(error.message, true, 8000); }
@@ -1338,6 +1389,7 @@
   navigator.mediaDevices?.addEventListener?.('devicechange', () => { if (state.captureMode === 'idle') enumerateMicrophones().catch(() => {}); });
 
   async function initialize() {
+    renderInputLimits();
     await Promise.allSettled([poll(), initializeQueue(), enumerateMicrophones()]);
     if (!state.uploadQueue.length) await finalizeReadySessions();
     setInterval(async () => {
@@ -1349,5 +1401,6 @@
       updateCaptureHealth();
     }, 5000);
   }
+  for (const field of textFields) $(field.selector).addEventListener('input', renderInputLimits);
   initialize().catch((error) => toast(error.message, true));
 })();

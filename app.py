@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from asr import ASREngine
 from codex_bridge import CodexBridge, CodexBridgeError
@@ -29,6 +29,8 @@ from ai_settings import AISettings, empty_usage, record_usage
 from version import __version__
 from classroom_features import ClassroomFeatures, wav_duration
 from course_catalog import glossary_terms, validate_glossary
+from session_order import creation_order, newest_first
+from input_limits import INPUT_LIMITS, require_content, validation_message
 
 ROOT = Path(__file__).resolve().parent
 
@@ -137,7 +139,7 @@ class Classroom(ClassroomFeatures):
                 self.sessions[s["id"]] = s
             except (OSError, ValueError, TypeError):
                 self.warnings.append(f"有一份历史课程文件无法读取，原文件已保留：{path.parent.name}")
-        self.current = max(self.sessions.values(), key=lambda s: s["created_at"])["id"] if self.sessions else self.new_session("新的课堂")["id"]
+        self.current = newest_first(self.sessions.values())[0]["id"] if self.sessions else self.new_session("新的课堂")["id"]
 
     def start(self):
         for fn, name in ((self._audio_loop, "transcription"), (self._ai_loop, "study"), (self._idle_loop, "grouping")):
@@ -174,6 +176,7 @@ class Classroom(ClassroomFeatures):
         with self.lock:
             sid = uuid.uuid4().hex
             s = {"id": sid, "title": title[:160] or "新的课堂", "created_at": stamp(),
+                 "creation_order": max((creation_order(existing) for existing in self.sessions.values()), default=0) + 1,
                  "demo": demo, "segments": [], "groups": [], "questions": [], "audio": [], "revisions": [], "course_id": None,
                  "settings": {"terms": "", "auto_analyze": not demo and self.connection.values["provider"] != "api"}, "pending_ids": [],
                  "ai_usage": empty_usage(),
@@ -198,9 +201,9 @@ class Classroom(ClassroomFeatures):
             soundcheck = {k: v for k, v in self.soundcheck.items() if k not in ("path", "prompt")}
             return {"session": copy.deepcopy(active),
                     "courses": copy.deepcopy(self.courses), "ai": copy.deepcopy(self.ai), "soundcheck": soundcheck,
-                    "sessions": [{k: s[k] for k in ("id", "title", "created_at", "demo")} for s in sorted(self.sessions.values(), key=lambda x: x["created_at"], reverse=True)],
+                    "sessions": [{k: s[k] for k in ("id", "title", "created_at", "demo")} for s in newest_first(self.sessions.values())],
                     "status": {"asr": asr_status, "codex": codex_status, "ai": self.ai_status(codex_status)},
-                    "version": __version__, "ai_settings": self.ai_settings(),
+                    "version": __version__, "input_limits": dict(INPUT_LIMITS), "ai_settings": self.ai_settings(),
                     "ai_usage": copy.deepcopy(active.get("ai_usage", empty_usage())),
                     "jobs": [copy.deepcopy(j) for j in list(self.jobs.values())[-120:] if j["session_id"] == active["id"]],
                     "queue": {"audio": sum(j["kind"] == "audio" and j["status"] in ("pending", "running") for j in self.jobs.values()),
@@ -511,7 +514,7 @@ class Classroom(ClassroomFeatures):
                 raise HTTPException(400, "演示不调用 AI。请新建课程，或用文本录入测试真实问答。")
             item = {"id": f"Q{len(s['questions']) + 1:04d}", "question": question, "answer": "", "group_id": group_id,
                     "created_at": stamp(), "context_snapshot": self.context(s, question, group_id),
-                    "history_snapshot": [{"role": role, "content": value} for q in s["questions"][-5:] if q.get("status") == "done" for role, value in (("user", q["question"]), ("assistant", q["answer"]))]}
+                    "history_snapshot": [{"role": role, "content": value} for q in s["questions"][-5:] if q.get("status") == "done" and not q.get("stale") for role, value in (("user", q["question"]), ("assistant", q["answer"]))]}
             s["questions"].append(item)
             job = self._enqueue_ai(s, item, "question")
             self.save(s)
@@ -739,14 +742,18 @@ class NewSession(BaseModel):
 
 
 class TextInput(BaseModel):
-    text: str = Field(min_length=1, max_length=12000)
+    text: str = Field(min_length=1, max_length=INPUT_LIMITS["text"])
     session_id: str | None = None
+
+    _nonblank = field_validator("text")(require_content)
 
 
 class AskInput(BaseModel):
-    question: str = Field(min_length=1, max_length=4000)
+    question: str = Field(min_length=1, max_length=INPUT_LIMITS["question"])
     group_id: str | None = None
     session_id: str | None = None
+
+    _nonblank = field_validator("question")(require_content)
 
 
 class SessionInput(BaseModel):
@@ -766,7 +773,7 @@ class CourseSelection(BaseModel):
 
 
 class GlossaryInput(BaseModel):
-    syllabus: str = Field(default="", max_length=12000)
+    syllabus: str = Field(default="", max_length=INPUT_LIMITS["syllabus"])
 
 
 class ResumeInput(BaseModel):
@@ -803,7 +810,7 @@ def create_app(config=None, data=None, engine=None, bridge=None):
     async def invalid_input(request, exc):
         # Pydantic's default response can echo a credential supplied in an
         # invalid field. Never reflect request bodies from the settings form.
-        return JSONResponse({"detail": "提交的数据格式无效，请检查输入。"}, status_code=422)
+        return JSONResponse({"detail": validation_message(request.url.path, exc.errors())}, status_code=422)
 
     @app.middleware("http")
     async def local_only(request, call_next):
