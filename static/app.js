@@ -15,6 +15,8 @@
     modeSaving: false, selectedCourseBusy: false, glossaryCourseId: null,
     soundcheck: null, captureKind: 'classroom', flushing: false, retranscribeSubmitting: false, glossarySubmitting: false,
     aiSettings: null, aiSettingsBusy: false, aiResuming: false,
+    slideSelection: null, includeImagesPreference: null, slideBusy: false, editingSlide: null,
+    studyBusy: false, studyReview: null, studyFailedParams: null, studyDrafts: new Map(),
   };
 
   const escapeHTML = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
@@ -152,7 +154,9 @@
     if ([...element.querySelectorAll('audio')].some((audio) => !audio.paused && !audio.ended)) return;
     const nearBottom = element.scrollHeight - element.scrollTop - element.clientHeight < 70;
     const scroll = element.scrollTop;
+    const expanded = new Set([...element.querySelectorAll('details[data-evidence]')].filter((item) => item.open).map((item) => item.dataset.evidence));
     element.innerHTML = html;
+    for (const item of element.querySelectorAll('details[data-evidence]')) item.open = expanded.has(item.dataset.evidence);
     state.renderKeys[selector] = key;
     const typing = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName) || Boolean(document.querySelector('dialog[open]'));
     if (nearBottom && state.followLive && !typing) element.scrollTop = element.scrollHeight;
@@ -226,6 +230,7 @@
   function updateAIFormControls() {
     const apiMode = $('#ai-provider').value === 'api';
     const busy = state.aiSettingsBusy;
+    const loading = aiIsLoading();
     $('#ai-api-fields').hidden = !apiMode;
     $('#ai-codex-help').hidden = apiMode;
     for (const selector of ['#ai-provider', '#ai-test-button', '#ai-save-button']) $(selector).disabled = busy;
@@ -234,7 +239,11 @@
     $('#ai-key').disabled = busy || !apiMode || $('#ai-clear-key').checked;
     $('#ai-base-url').required = apiMode;
     $('#ai-model').required = apiMode;
-    $('#ai-save-button').textContent = busy ? '请稍候…' : '保存设置';
+    $('#ai-save-button').disabled = busy || loading;
+    $('#ai-save-button').textContent = busy ? '请稍候…' : loading ? '正在加载，暂不能更换' : '保存设置';
+    $('#ai-force-button').hidden = !loading;
+    $('#ai-force-button').disabled = busy;
+    $('#ai-switch-protection').hidden = !loading;
     $('#ai-test-button').textContent = apiMode ? '测试连接' : '检查登录';
     $('#ai-settings-form').setAttribute('aria-busy', String(busy));
   }
@@ -280,10 +289,17 @@
     finally { state.aiSettingsBusy = false; updateAIFormControls(); }
   }
 
-  async function submitAISettings(testOnly = false) {
+  function aiIsLoading() {
+    if (typeof state.snapshot?.ai_settings?.busy === 'boolean') return state.snapshot.ai_settings.busy;
+    return Boolean(state.snapshot?.status?.ai?.busy || Number(state.snapshot?.queue?.ai) > 0 || [...(state.session?.groups || []), ...(state.session?.questions || [])].some((item) => isPending(item.status)));
+  }
+
+  async function submitAISettings(testOnly = false, force = false) {
     if (state.aiSettingsBusy) return;
+    if (!testOnly && !force && aiIsLoading()) { showAISettingsResult('正在加载，暂不能更换。可等待完成，或点击「强制更换」。', true); return; }
     if (!$('#ai-settings-form').reportValidity()) return;
     const body = readAIForm();
+    if (force && !testOnly) body.force = true;
     if (testOnly && body.clear_key) { showAISettingsResult('已选择清除密钥，无法测试。取消勾选后可使用已有或新密钥测试。', true); return; }
     state.aiSettingsBusy = true; updateAIFormControls();
     showAISettingsResult(testOnly ? body.provider === 'api' ? '正在测试当前配置；配置尚未保存…' : '正在检查本机 Codex 登录…' : '正在保存设置…');
@@ -306,6 +322,223 @@
       }
     } catch (error) { showAISettingsResult(safeMessage(error.message), true); }
     finally { state.aiSettingsBusy = false; updateAIFormControls(); }
+  }
+
+  // Classroom time follows captured samples, never wall time. Capture the value
+  // synchronously at the user's click, before any settings/network await.
+  function classroomAnchor() {
+    if (state.capture?.kind === 'classroom' && Number.isFinite(state.capture.segmenter?.time)) return state.capture.segmenter.time;
+    return Math.max(0, state.clockSeconds || 0, ...(state.session?.segments || []).map((item) => Number(item.end) || 0), ...(state.session?.audio || []).map((item) => (Number(item.start) || 0) + (Number(item.duration) || 0)));
+  }
+
+  const slideURL = (id, sessionId) => `/api/slides/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionId)}`;
+  const rangeText = (range) => range?.start != null ? `${timecode(range.start)} — ${range.end == null ? '持续中' : timecode(range.end)}` : '暂无已转写原文';
+
+  function evidenceHTML(question, sessionId) {
+    const evidence = question.evidence || {};
+    const slides = evidence.slides || [];
+    const warnings = evidence.warnings || [];
+    return `<div class="study-evidence"><p><strong>请求范围</strong> ${escapeHTML(rangeText(evidence.requested_range))}<br><strong>实际原文范围</strong> ${escapeHTML(rangeText(evidence.actual_range))}</p>${evidence.incomplete ? '<p class="review-note">尚不能确认原文完整，回答只能依据当前已收到的材料。之后可选择「补齐 / 用新材料解释」。</p>' : ''}${warnings.map((warning) => `<p class="review-note">${escapeHTML(warning)}</p>`).join('')}<div class="evidence-slides">${slides.map((slide) => `<figure><a href="${slideURL(slide.id, sessionId)}" target="_blank" rel="noopener"><img src="${slideURL(slide.id, sessionId)}" alt="${escapeHTML(slide.title || slide.id)}" loading="lazy"></a><figcaption>${escapeHTML(slide.title || slide.id)} · ${escapeHTML(rangeText(slide))}</figcaption></figure>`).join('')}</div>${(evidence.segments || []).map((segment) => `<div class="evidence-segment"><span class="timecode">${escapeHTML(rangeText(segment))} · ${escapeHTML(segment.id || '')}</span><p>${escapeHTML(segment.text)}</p></div>`).join('') || '<p class="small muted">此快照没有可用的课堂原文。</p>'}</div>`;
+  }
+
+  function studyActions(question) {
+    if (!question.study || isDemo()) return '';
+    const id = escapeHTML(question.id);
+    const pending = isPending(question.status);
+    return `<div class="study-actions">${question.status === 'prepared' ? `<button class="button subtle" data-study-review="${id}">确认发送</button>` : ''}${!pending && (question.error || question.stream_status === 'interrupted') ? `<button class="text-button" data-study-retry="${id}">重试原材料</button>` : ''}${!pending && question.status !== 'prepared' ? `<button class="text-button" data-study-refresh="${id}">补齐 / 用新材料解释</button>` : ''}</div><details class="evidence-details" data-evidence="${id}"><summary>查看本次依据 · ${(question.evidence?.slides || []).length} 张课件</summary>${evidenceHTML(question, state.session.id)}</details>`;
+  }
+
+  function showStudyStatus(message, error = false) {
+    $('#study-status').textContent = message;
+    $('#study-status').hidden = !message;
+    $('#study-status').classList.toggle('error', error);
+    $('#study-reprepare').hidden = !state.studyFailedParams;
+  }
+
+  function renderSlides() {
+    const slides = state.session?.slides || [];
+    $('#slides-count').textContent = slides.length;
+    $('#slides-auto').checked = state.slideSelection === null;
+    $('#slides-selection-note').textContent = state.slideSelection === null ? '自动按范围选择' : `已手选 ${state.slideSelection.size} 张（最多 4 张）`;
+    $('#include-slides').checked = state.includeImagesPreference ?? slides.length > 0;
+    $('#study-range-label').hidden = !$('#include-slides').checked;
+    $('#slide-file').disabled = state.slideBusy || isDemo() || !state.connected;
+    $('#slides-auto').disabled = state.studyBusy;
+    const key = JSON.stringify([state.session?.id, slides, state.slideSelection === null ? null : [...state.slideSelection], state.studyBusy]);
+    const html = slides.map((slide) => `<article class="slide-card"><label><input type="checkbox" data-slide-select="${escapeHTML(slide.id)}" ${state.slideSelection?.has(slide.id) ? 'checked' : ''} ${state.slideSelection === null || state.studyBusy ? 'disabled' : ''}><span>${escapeHTML(slide.title || slide.id)}</span></label><button class="slide-thumbnail" data-slide-edit="${escapeHTML(slide.id)}" aria-label="查看 ${escapeHTML(slide.title || slide.id)}"><img src="${slideURL(slide.id, state.session.id)}" alt="${escapeHTML(slide.title || slide.id)}" loading="lazy"></button><div class="slide-caption"><span class="timecode">${escapeHTML(rangeText(slide))}</span><button class="text-button" data-slide-edit="${escapeHTML(slide.id)}">编辑范围</button></div></article>`).join('');
+    replaceList('#slides-gallery', html || '<p class="small muted">还没有课件。可添加老师的幻灯片、板书照片或截图。</p>', key);
+    for (const button of document.querySelectorAll('[data-study-mode]')) button.disabled = state.studyBusy || isDemo() || !state.connected;
+    $('#study-reprepare').disabled = state.studyBusy;
+  }
+
+  async function uploadSlide(file) {
+    if (!file || state.slideBusy || !state.session) return;
+    if (isDemo()) { toast('请新建真实课程后添加课件。', true); return; }
+    if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) { toast('请选择 PNG、JPEG 或 WebP 图片，一次一张。', true); return; }
+    const sessionId = state.session.id;
+    const start = classroomAnchor();
+    state.slideBusy = true; renderSlides(); renderQueue();
+    $('#slide-status').hidden = false; $('#slide-status').textContent = '正在保存图片到本机…';
+    try {
+      const query = new URLSearchParams({ session_id: sessionId, start: String(start), title: file.name || '粘贴的课件' });
+      await api(`/api/slides?${query}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
+      $('#slide-file').value = '';
+      $('#slide-status').textContent = `已保存，起点 ${timecode(start)}；可编辑对应课堂范围。`;
+      await poll(true);
+    } catch (error) { $('#slide-status').textContent = `图片未保存：${error.message}。原选择保留，可重试。`; toast(error.message, true); }
+    finally { state.slideBusy = false; renderSlides(); renderQueue(); }
+  }
+
+  function editSlide(id) {
+    const slide = state.session?.slides?.find((item) => item.id === id);
+    if (!slide || state.slideBusy) return;
+    state.editingSlide = { id, sessionId: state.session.id };
+    $('#slide-preview').src = slideURL(id, state.session.id);
+    $('#slide-title').value = slide.title || '';
+    $('#slide-start').value = String(slide.start || 0);
+    $('#slide-end').value = slide.end == null ? '' : String(slide.end);
+    $('#slide-edit-status').hidden = true;
+    $('#slide-dialog').showModal();
+  }
+
+  function frozenStudyParams(mode, question = '', explain = true) {
+    const params = { session_id: state.session.id, mode, anchor: classroomAnchor(), question, explain, include_images: $('#include-slides').checked };
+    if (mode === 'group' && state.selectedGroup) params.group_id = state.selectedGroup;
+    if (state.slideSelection !== null) params.slide_ids = [...state.slideSelection];
+    return params;
+  }
+
+  function captureStudySelection(params) {
+    const segments = state.session?.segments || [];
+    // Only identities/versions leave the browser. The server reconstructs and
+    // validates its own stored source, rather than trusting client text.
+    if (!Array.isArray(params.seen_segments)) params.seen_segments = segments.map((item) => ({ id: item.id, version: item.version || 0 }));
+    if (!Array.isArray(params.seen_slides)) params.seen_slides = (state.session?.slides || []).map((item) => ({ id: item.id, sha256: item.sha256, start: item.start, end: item.end ?? null, title: item.title || '' }));
+    if (params.mode !== 'group' || Array.isArray(params.seen_group_segment_ids)) return true;
+    const groups = state.session?.groups || [];
+    let group = params.group_id ? groups.find((item) => item.id === params.group_id) : null;
+    if (!params.group_id) {
+      const candidates = groups.map((item, index) => {
+        const members = segments.filter((segment) => (item.segment_ids || []).includes(segment.id));
+        const start = item.start ?? (members.length ? Math.min(...members.map((segment) => segment.start)) : null);
+        const end = item.end ?? (members.length ? Math.max(...members.map((segment) => segment.end)) : null);
+        return { item, index, start, end };
+      }).filter((item) => Number.isFinite(item.start) && Number.isFinite(item.end) && item.start <= params.anchor);
+      candidates.sort((left, right) => right.end - left.end || right.start - left.start || right.index - left.index);
+      group = candidates[0]?.item;
+    }
+    if (!group) return false;
+    params.group_id = group.id;
+    params.seen_group_segment_ids = [...(group.segment_ids || [])];
+    return true;
+  }
+
+  function renderStudyReview() {
+    const review = state.studyReview;
+    if (!review) return;
+    const question = review.question;
+    const destination = question.destination || {};
+    const hasImages = Boolean(question.evidence?.slides?.length);
+    const unsupported = hasImages && question.vision?.state === 'unsupported';
+    const visionText = !hasImages ? '本次仅发送原文。' : unsupported ? '此配置已明确不支持图片，不能带图发送。可选择「仅用原文」，保留同一份原文快照。' : question.vision?.state === 'supported' ? question.vision.message || '此配置曾完成同数量图片的请求，不代表本次一定成功或答案正确。' : '图片能力未知：此配置尚未确认支持图片，发送可能失败。';
+    $('#study-review').innerHTML = `<dl class="study-destination"><dt>接入</dt><dd>${escapeHTML(destination.label || providerLabel(destination.provider))} (${escapeHTML(destination.provider || '')})</dd><dt>地址</dt><dd>${escapeHTML(destination.base_url || '本机 Codex · 当前登录账号')}</dd><dt>模型</dt><dd>${escapeHTML(destination.model || 'Codex 当前配置模型')}</dd></dl><p class="${unsupported || question.vision?.state === 'unknown' ? 'review-note' : 'dialog-help'}">${escapeHTML(visionText)}</p><p class="study-review-question"><strong>问题</strong><br>${escapeHTML(question.question)}</p>${evidenceHTML(question, review.sessionId)}`;
+    $('#study-send').disabled = state.studyBusy || unsupported || question.status !== 'prepared';
+    $('#study-text-only').disabled = state.studyBusy;
+    $('#study-text-only').hidden = !hasImages;
+    $('#study-remember-label').hidden = !hasImages || unsupported;
+    $('#study-remember').disabled = state.studyBusy || unsupported;
+  }
+
+  function openStudyReview(question, sessionId = state.session.id) {
+    state.studyReview = { question, sessionId };
+    $('#study-remember').checked = false;
+    $('#study-send-status').hidden = true;
+    renderStudyReview();
+    if (!$('#study-dialog').open) $('#study-dialog').showModal();
+  }
+
+  async function sendPrepared(question, sessionId, confirmImages = false, remember = false) {
+    if (question.evidence?.slides?.length && question.vision?.state === 'unsupported') throw new Error('此配置不支持图片，请选择「仅用原文」。');
+    await api(`/api/study/${encodeURIComponent(question.id)}/send`, { method: 'POST', body: { session_id: sessionId, destination_token: question.destination?.token, confirm_images: confirmImages, remember } });
+    const draftKey = `${sessionId}:${question.id}`;
+    const draft = state.studyDrafts.get(draftKey);
+    if (draft != null && state.session?.id === sessionId && $('#question-input').value === draft) $('#question-input').value = '';
+    state.studyDrafts.delete(draftKey);
+    if (state.studyReview?.question.id === question.id) { $('#study-dialog').close(); state.studyReview = null; }
+    showStudyStatus('已加入 AI 队列，提问时的材料已固定。');
+  }
+
+  async function prepareStudy(params) {
+    if (state.studyBusy) return;
+    if (isDemo()) { toast('演示课程不调用 AI，请先新建真实课程。'); return; }
+    // Freeze before saveSettings or prepare can yield. On a selection retry the
+    // original metadata remains intact; only an explicit refresh captures anew.
+    if (!captureStudySelection(params)) { state.studyFailedParams = null; showStudyStatus('还没有可选的意群，请先整理原文或选择最近一段时间。', true); return; }
+    if (params.slide_ids?.some((id) => !params.seen_slides.some((item) => item.id === id))) { state.studyFailedParams = params; showStudyStatus('所选课件在上次点击时尚不存在。要加入新图片，请重新点击快捷解释或发送问题。', true); return; }
+    if (params.slide_ids?.length > 4) { state.studyFailedParams = params; showStudyStatus('手选超过 4 张，请在课件中减少选择，再重试同一时间段。', true); $('#slides-panel').open = true; return; }
+    state.studyBusy = true; renderSlides(); renderQueue();
+    state.studyFailedParams = null; showStudyStatus('正在固定课堂原文与课件…');
+    let prepared = null;
+    try {
+      await saveSettings();
+      prepared = await api('/api/study/prepare', { method: 'POST', body: params });
+      if (!params.explain) state.studyDrafts.set(`${params.session_id}:${prepared.id}`, params.question);
+      const hasImages = Boolean(prepared.evidence?.slides?.length);
+      if (hasImages && (prepared.requires_confirmation || prepared.vision?.state === 'unsupported')) {
+        openStudyReview(prepared, params.session_id);
+        showStudyStatus('材料已固定，确认发送后开始解释。');
+      } else await sendPrepared(prepared, params.session_id);
+      await poll(true);
+    } catch (error) {
+      if (prepared) openStudyReview(prepared, params.session_id);
+      else state.studyFailedParams = params;
+      showStudyStatus(error.message, true);
+      if (error.status === 422 && /4.*张|超过\s*4|最多\s*4|至多\s*4/.test(error.message)) { $('#slides-panel').open = true; toast(`${error.message} 请在课件中关闭自动选择并手动勾选，然后重试同一时间段。`, true, 9000); }
+    } finally { state.studyBusy = false; renderSlides(); renderQueue(); renderStudyReview(); }
+  }
+
+  async function confirmStudy(textOnly = false) {
+    if (state.studyBusy || !state.studyReview) return;
+    const review = state.studyReview;
+    let question = review.question;
+    state.studyBusy = true; renderStudyReview(); renderQueue();
+    $('#study-send-status').hidden = false; $('#study-send-status').textContent = '正在提交…';
+    try {
+      if (textOnly) {
+        const originalId = question.id;
+        question = await api(`/api/study/${encodeURIComponent(originalId)}/text-only`, { method: 'POST', body: { session_id: review.sessionId } });
+        const draftKey = `${review.sessionId}:${originalId}`;
+        if (state.studyDrafts.has(draftKey)) state.studyDrafts.set(`${review.sessionId}:${question.id}`, state.studyDrafts.get(draftKey));
+        state.studyReview = { question, sessionId: review.sessionId };
+      }
+      await sendPrepared(question, review.sessionId, !textOnly, !textOnly && $('#study-remember').checked);
+      await poll(true);
+    } catch (error) {
+      $('#study-send-status').textContent = error.message;
+      $('#study-send-status').hidden = false;
+      await poll(true); // Refresh a changed destination; never resend automatically.
+    } finally { state.studyBusy = false; renderStudyReview(); renderSlides(); renderQueue(); }
+  }
+
+  async function retryStudy(question) {
+    if (state.studyBusy) return;
+    const sessionId = state.session.id;
+    state.studyBusy = true; renderSlides(); renderQueue();
+    try {
+      const prepared = await api(`/api/study/${encodeURIComponent(question.id)}/retry`, { method: 'POST', body: { session_id: sessionId } });
+      openStudyReview(prepared, sessionId); // Retrying always requires an explicit send.
+      showStudyStatus('已保留原材料快照，请确认后重试。');
+      await poll(true);
+    } catch (error) { showStudyStatus(error.message, true); }
+    finally { state.studyBusy = false; renderStudyReview(); renderSlides(); renderQueue(); }
+  }
+
+  function refreshStudy(question) {
+    const params = { ...question.request_params, session_id: state.session.id, anchor: question.evidence?.requested_range?.end, question: question.question, explain: question.explain !== false };
+    for (const key of ['seen_segments', 'seen_slides', 'seen_group_segment_ids']) delete params[key];
+    if (!Number.isFinite(params.anchor)) { showStudyStatus('这条记录没有有效的原始时间范围，无法补齐。', true); return; }
+    if (!params.mode) params.mode = question.group_id ? 'group' : 'recent120';
+    return prepareStudy(params);
   }
 
   function render() {
@@ -352,11 +585,25 @@
       return `<article class="group-card${state.selectedGroup === group.id ? ' selected' : ''}" id="group-${escapeHTML(group.id)}"><div class="group-topline"><strong>意群 ${String(index + 1).padStart(2, '0')}</strong><div class="group-meta"><span class="timecode">${timecode(group.start)}</span><span class="group-state ${escapeHTML(group.status || '')}">${escapeHTML(statusLabel(group.status))}</span></div></div>${group.stale ? `<p class="stale-note">${escapeHTML(group.stale_reason || '原文已修改，以下解释可能需要更新。')} 可点击「重新分析」。</p>` : ''}<blockquote class="group-source">${escapeHTML(source)}</blockquote>${content}<div class="group-bottom"><span>${escapeHTML(group.id)} · ${(group.segment_ids || []).length} 段原文</span><span class="group-actions">${retry}<button class="text-button" data-group="${escapeHTML(group.id)}">基于本段提问 ↗</button></span></div></article>`;
     }).join('');
     replaceList('#groups-list', groupsHTML || emptyGroups, `${session.id}:${state.focusMode}:${state.selectedGroup}:${JSON.stringify(groups)}:${JSON.stringify(segments.map((segment) => [segment.id, segment.text]))}`);
-    const questionsHTML = questions.map((question) => `<article class="question-block"><p class="user-question">${escapeHTML(question.question)}</p><div class="answer-label">${isDemo() ? '示例回答 · 非 AI 实时生成' : 'AI · 随堂解答'}${question.group_id ? ` · ${escapeHTML(question.group_id)}` : ''}</div>${question.stale ? `<p class="stale-note">本次问答基于提问时的原文，之后相关内容已有修改。${question.answer ? '原回答保留供对照。' : ''}${question.stale_reason ? ` ${escapeHTML(question.stale_reason)}` : ''}</p>` : ''}<div class="question-answer">${renderAIResponse(question, question.answer, true)}${!isPending(question.status) && (question.error || question.stream_status === 'interrupted') && !isDemo() ? `<button class="text-button" data-retry-question="${escapeHTML(question.id)}">重试回答</button>` : ''}</div></article>`).join('');
+    const questionsHTML = questions.map((question) => `<article class="question-block"><p class="user-question">${escapeHTML(question.question)}</p><div class="answer-label">${isDemo() ? '示例回答 · 非 AI 实时生成' : 'AI · 随堂解答'}${question.group_id ? ` · ${escapeHTML(question.group_id)}` : ''}</div>${question.stale ? `<p class="stale-note">本次问答基于提问时的原文，之后相关内容已有修改。${question.answer ? '原回答保留供对照。' : ''}${question.stale_reason ? ` ${escapeHTML(question.stale_reason)}` : ''}</p>` : ''}<div class="question-answer">${question.study && question.status === 'prepared' ? '<p class="analysis-pending">材料已固定，等待确认发送。</p>' : renderAIResponse(question, question.answer, true)}${!question.study && !isPending(question.status) && (question.error || question.stream_status === 'interrupted') && !isDemo() ? `<button class="text-button" data-retry-question="${escapeHTML(question.id)}">重试回答</button>` : ''}${studyActions(question)}</div></article>`).join('');
     replaceList('#questions-list', questionsHTML || emptyQuestions, `${session.id}:${JSON.stringify(questions)}`);
     renderEngineStatus();
     renderAISettingsStatus();
     renderAIUsage();
+    updateAIFormControls();
+    renderSlides();
+    if (state.studyReview?.sessionId === session.id) {
+      const current = questions.find((item) => item.id === state.studyReview.question.id);
+      if (current) {
+        if (current.destination?.token !== state.studyReview.question.destination?.token) {
+          $('#study-remember').checked = false;
+          $('#study-send-status').textContent = 'AI 目的地已变化，请核对新地址和模型后重新确认。';
+          $('#study-send-status').hidden = false;
+        }
+        state.studyReview.question = current;
+        renderStudyReview();
+      }
+    }
     renderQueue();
     renderCapture();
     renderCourseTools();
@@ -508,7 +755,7 @@
       $('#audio-queue-text').textContent = `${queue.length} 段音频待发送（${Math.ceil(duration)} 秒）${failure ? `：${failure.error}` : state.uploadPromise ? ' · 正在传到本机服务' : ' · 等待发送'}${state.db ? ' · 已暂存浏览器' : ' · 仅暂存在当前页面'}`;
       $('#retry-audio').hidden = !state.uploadPaused;
     }
-    const busy = state.captureMode !== 'idle' || queue.length > 0 || state.finalizing.size > 0 || state.switching;
+    const busy = state.captureMode !== 'idle' || queue.length > 0 || state.finalizing.size > 0 || state.switching || state.slideBusy || state.studyBusy;
     $('#session-select').disabled = busy;
     $('#new-session').disabled = busy;
     $('#demo-button').disabled = busy;
@@ -571,6 +818,13 @@
       $('#connection-label').textContent = '已连接本地服务';
       if (previousSession !== state.session?.id) {
         state.selectedGroup = null;
+        state.slideSelection = null;
+        state.includeImagesPreference = null;
+        state.studyFailedParams = null;
+        state.studyReview = null;
+        $('#study-dialog').close();
+        $('#slide-dialog').close();
+        showStudyStatus('');
         state.renderKeys = {};
         state.settingsDirty = false;
         const persistedTime = Number(localStorage.getItem(`classroom-time-${state.session?.id}`)) || 0;
@@ -622,8 +876,8 @@
   }
 
   function canSwitch() {
-    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.finalizing.size || state.switching) {
-      toast('请先暂停录音，并发送完待处理音频后再切换课程。', true);
+    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.finalizing.size || state.switching || state.slideBusy || state.studyBusy) {
+      toast('请先暂停录音，并等待音频、课件和问题提交完成后再切换课程。', true);
       return false;
     }
     return true;
@@ -1051,8 +1305,69 @@
   $('#ai-clear-key').addEventListener('change', () => { if ($('#ai-clear-key').checked) $('#ai-key').value = ''; updateAIFormControls(); });
   $('#ai-settings-form').addEventListener('submit', (event) => { event.preventDefault(); return submitAISettings(); });
   $('#ai-test-button').addEventListener('click', () => submitAISettings(true));
+  $('#ai-force-button').addEventListener('click', () => submitAISettings(false, true));
   $('#ai-settings-dialog').addEventListener('close', () => { $('#ai-key').value = ''; $('#ai-clear-key').checked = false; });
   $('#ai-settings-dialog').addEventListener('cancel', () => { $('#ai-key').value = ''; $('#ai-clear-key').checked = false; });
+
+  $('#slide-file').addEventListener('change', () => uploadSlide($('#slide-file').files?.[0]));
+  $('#slide-paste').addEventListener('paste', (event) => {
+    const images = [...(event.clipboardData?.items || [])].filter((item) => item.type.startsWith('image/'));
+    if (!images.length) return;
+    event.preventDefault();
+    if (images.length > 1) { toast('请一次粘贴一张图片。', true); return; }
+    return uploadSlide(images[0].getAsFile());
+  });
+  $('#slides-auto').addEventListener('change', () => { state.slideSelection = $('#slides-auto').checked ? null : new Set(); renderSlides(); });
+  $('#include-slides').addEventListener('change', () => { state.includeImagesPreference = $('#include-slides').checked; renderSlides(); });
+  $('#slides-gallery').addEventListener('change', (event) => {
+    const checkbox = event.target.closest('[data-slide-select]');
+    if (!checkbox || state.slideSelection === null || state.studyBusy) return;
+    if (checkbox.checked && state.slideSelection.size >= 4) { checkbox.checked = false; toast('最多选择 4 张，请先取消一张再选择。', true); return; }
+    if (checkbox.checked) state.slideSelection.add(checkbox.dataset.slideSelect);
+    else state.slideSelection.delete(checkbox.dataset.slideSelect);
+    renderSlides();
+  });
+  $('#slides-gallery').addEventListener('click', (event) => { const button = event.target.closest('[data-slide-edit]'); if (button) editSlide(button.dataset.slideEdit); });
+  $('#slide-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (state.slideBusy || !state.editingSlide || !$('#slide-form').reportValidity()) return;
+    const start = Number($('#slide-start').value);
+    const end = $('#slide-end').value.trim() === '' ? null : Number($('#slide-end').value);
+    if (!Number.isFinite(start) || start < 0 || (end !== null && (!Number.isFinite(end) || end <= start))) { $('#slide-edit-status').textContent = '结束必须晚于开始，或留空表示持续。'; $('#slide-edit-status').hidden = false; return; }
+    const editing = state.editingSlide;
+    state.slideBusy = true; $('#slide-save').disabled = true; renderQueue();
+    try {
+      await api(`/api/slides/${encodeURIComponent(editing.id)}`, { method: 'PATCH', body: { session_id: editing.sessionId, start, end, title: $('#slide-title').value } });
+      $('#slide-status').hidden = false;
+      $('#slide-status').textContent = `课件范围已更新：${rangeText({ start, end })}。已有问题仍保留当时的课件范围。`;
+      $('#slide-dialog').close(); await poll(true);
+    } catch (error) { $('#slide-edit-status').textContent = error.message; $('#slide-edit-status').hidden = false; }
+    finally { state.slideBusy = false; $('#slide-save').disabled = false; renderSlides(); renderQueue(); }
+  });
+  for (const button of document.querySelectorAll('[data-study-mode]')) button.addEventListener('click', () => {
+    if (state.studyBusy || !state.session || !state.connected) return;
+    const params = frozenStudyParams(button.dataset.studyMode);
+    return prepareStudy(params);
+  });
+  $('#study-reprepare').addEventListener('click', () => {
+    if (!state.studyFailedParams) return;
+    const params = { ...state.studyFailedParams };
+    delete params.slide_ids;
+    if (state.slideSelection !== null) params.slide_ids = [...state.slideSelection];
+    return prepareStudy(params);
+  });
+  $('#study-send').addEventListener('click', () => confirmStudy());
+  $('#study-text-only').addEventListener('click', () => confirmStudy(true));
+  $('#questions-list').addEventListener('click', (event) => {
+    const button = event.target.closest('[data-study-review], [data-study-retry], [data-study-refresh]');
+    if (!button || state.studyBusy) return;
+    const id = button.dataset.studyReview || button.dataset.studyRetry || button.dataset.studyRefresh;
+    const question = state.session?.questions?.find((item) => item.id === id && item.study);
+    if (!question) return;
+    if (button.dataset.studyReview) openStudyReview(question);
+    else if (button.dataset.studyRetry) return retryStudy(question);
+    else return refreshStudy(question);
+  });
 
   $('#runtime-mode').addEventListener('change', async () => {
     state.modeSaving = true;
@@ -1319,10 +1634,14 @@
   });
   $('#question-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    if ($('#ask-button').disabled) return;
+    if ($('#ask-button').disabled || state.studyBusy) return;
     const question = validatedText('#question-input');
     if (question === null) return;
     if (isDemo()) { toast('演示模式不调用 AI。请新建课程并加入真实课堂原文后提问。'); return; }
+    if ($('#include-slides').checked) {
+      const params = frozenStudyParams(state.selectedGroup ? 'group' : $('#study-range').value || 'recent120', question, false);
+      return prepareStudy(params);
+    }
     $('#ask-button').disabled = true;
     try {
       await saveSettings();
@@ -1382,7 +1701,7 @@
 
   document.addEventListener('click', (event) => { if (!event.target.closest('.export-menu')) $('.export-menu').open = false; });
   window.addEventListener('beforeunload', (event) => {
-    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.settingsDirty || state.finalizing.size) {
+    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.settingsDirty || state.finalizing.size || state.slideBusy || state.studyBusy) {
       event.preventDefault(); event.returnValue = '';
     }
   });

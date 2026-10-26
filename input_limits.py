@@ -20,13 +20,15 @@ def validation_message(path: str, errors: list[dict]) -> str:
         field, label = "text", "原文"
     elif path.startswith("/api/segments/") and path.endswith("/edit"):
         field, label = "text", "修正后的原文"
-    elif path == "/api/ask":
+    elif path in ("/api/ask", "/api/study/prepare"):
         field, label = "question", "问题"
     elif path.startswith("/api/courses/") and path.endswith("/glossary"):
         field, label = "syllabus", "大纲"
     else:
         return "提交的数据格式无效，请检查输入。"
     for error in errors:
+        if path == '/api/study/prepare' and error.get('loc') == ('body', 'slide_ids'):
+            return '每次最多使用 4 张课件图片，请缩小范围或明确选择；不会静默漏图。'
         if error.get("loc") != ("body", field):
             continue
         value = error.get("input")

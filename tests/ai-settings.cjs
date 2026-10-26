@@ -36,7 +36,7 @@ for (const match of html.matchAll(/<([a-z][\w-]*)\b[^>]*\bid="([^"]+)"[^>]*>/gi)
 }
 for (const match of source.matchAll(/\$\('(#[-\w]+)'\)/g)) assert.ok(elements.has(match[1]), `missing DOM node ${match[1]}`);
 assert.match(html, /id="ai-key" type="password" autocomplete="new-password"/);
-assert.match(html, /课间 1\.1\.1/);
+assert.match(html, /课间 1\.2\.0/);
 const aiButtons = ['backfill', 'latest'].map((strategy) => { const button = new Element('BUTTON'); button.dataset.aiResume = strategy; return button; });
 const closeButtons = [...html.matchAll(/data-close-dialog="([^"]+)"/g)].map((match) => { const button = new Element('BUTTON'); button.dataset.closeDialog = match[1]; return button; });
 const document = {

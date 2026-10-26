@@ -76,7 +76,7 @@ def test_settings_and_export_never_reveal_key(local_client):
         assert "synthetic-only-secret" not in response.text
     for path in room.data.rglob("*.json"):
         assert "synthetic-only-secret" not in path.read_text(encoding="utf-8")
-    assert client.get("/api/health").json()["version"] == "1.1.1"
+    assert client.get("/api/health").json()["version"] == "1.2.0"
 
 
 def test_secret_not_echoed_on_validation_failure(local_client):
@@ -195,7 +195,12 @@ def test_switch_finishes_current_request_then_requires_explicit_resume(room_fact
     room.ask("second")
     launch(room, "_ai_loop")
     assert StreamingAPI.entered.wait(2)
-    result = room.configure_ai({"provider": "codex"})
+    # v1.2 explicitly blocks ordinary changes while loading; force retains the
+    # original request destination and still requires resume for queued text.
+    with pytest.raises(HTTPException) as blocked:
+        room.configure_ai({"provider": "codex"})
+    assert blocked.value.status_code == 409
+    result = room.configure_ai({"provider": "codex", "force": True})
     assert result["pending"] and result["active_provider"] == "api"
     assert room.get()["questions"][1]["status"] == "paused"
     with pytest.raises(HTTPException) as exc:
@@ -302,6 +307,9 @@ def test_switch_disk_failure_cannot_redirect_queued_work(room_factory, monkeypat
         patcher.setattr(room, "save", fail_save)
         with pytest.raises(HTTPException) as exc:
             configure(room)
+        assert exc.value.status_code == 409
+        with pytest.raises(HTTPException) as exc:
+            configure(room, force=True)
         assert exc.value.status_code == 507
     assert room.ai["paused"] and not room.ai_ready.is_set()
     assert room.ai_settings()["provider"] == "codex"

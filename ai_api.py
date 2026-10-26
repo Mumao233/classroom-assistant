@@ -1,10 +1,11 @@
-"""Text-only Chat Completions adapter. Keys and raw diagnostics stay private.
+"""Chat Completions adapter for text and local images; diagnostics stay private.
 
 Each call sends exactly one HTTP request. Streaming deltas are provisional:
 the caller must only persist the return value as the completed answer.
 """
 from __future__ import annotations
 
+import base64
 import codecs
 import copy
 import ipaddress
@@ -13,12 +14,14 @@ import math
 import re
 import threading
 import time
+from pathlib import Path
 from typing import Callable
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import httpx
 
-from codex_bridge import CodexBridge, CodexBridgeError, _INSTRUCTIONS, _REFERENCE, _failure_kind
+from codex_bridge import (CodexBridge, CodexBridgeError, _INSTRUCTIONS, _check_cancelled,
+                          _failure_kind, _validate_references, _vision_unsupported)
 
 
 class ApiBridgeError(CodexBridgeError):
@@ -30,6 +33,8 @@ _MESSAGES = {
     "quota": "API 额度不足或请求受到限流，请检查服务商账户后再试；本机转写仍会保存。",
     "network": "暂时无法连接 API 服务，请检查网络和服务地址；本机转写仍会保存。",
     "timeout": "这次 API 回答超时了，请稍后手动重试；本机转写仍会保存。",
+    "vision_unsupported": "当前 API 模型明确不支持图片输入，请换用支持图片的模型，或主动选择仅用文字重新提问。",
+    "cancelled": "本次请求已取消，未采用回答；已发送的请求仍可能产生用量。",
     "other": "API 没有完成回答，请检查地址、模型和接口兼容性后再试。",
 }
 _MAX_RESPONSE_BYTES = 2_000_000
@@ -121,7 +126,7 @@ def _check_payload_error(payload):
 
 
 class ApiBridge(CodexBridge):
-    """Reuse the Codex text prompts while replacing only their transport."""
+    """Reuse the classroom prompts while replacing only their transport."""
 
     def __init__(self, config: dict, api_key: str, on_delta: Callable[[str], None] | None = None,
                  *, transport: httpx.BaseTransport | None = None):
@@ -189,42 +194,95 @@ class ApiBridge(CodexBridge):
             with self._lock:
                 self._last_usage = usage
 
-    def _emit(self, content):
+    def _emit(self, content, cancel_event=None):
+        _check_cancelled(cancel_event)
         if self.on_delta:
             try:
                 self.on_delta(content)
             except Exception:
                 raise _failure(message="暂时无法显示 API 回答，本次回答未完成。") from None
+        _check_cancelled(cancel_event)
 
     def _run(self, prompt: str, source: str, *, emit: bool = True,
-             max_tokens: int | None = None, instructions: str = _INSTRUCTIONS) -> str:
-        with self._request_lock:
+             max_tokens: int | None = None, instructions: str = _INSTRUCTIONS,
+             images: list[dict] | None = None, cancel_event=None, allowed_refs: set[str] | None = None) -> str:
+        if cancel_event is None:
+            self._request_lock.acquire()
+        else:
+            _check_cancelled(cancel_event)
+            while not self._request_lock.acquire(timeout=.1):
+                _check_cancelled(cancel_event)
+        try:
+            _check_cancelled(cancel_event)
             return self._request(prompt, source, emit=emit and not getattr(self._local, "suppress_delta", False),
-                                 max_tokens=max_tokens, instructions=instructions)
+                                 max_tokens=max_tokens, instructions=instructions, images=images,
+                                 cancel_event=cancel_event, allowed_refs=allowed_refs)
+        finally:
+            self._request_lock.release()
 
-    def _request(self, prompt, source, *, emit, max_tokens, instructions):
+    def _request(self, prompt, source, *, emit, max_tokens, instructions,
+                 images=None, cancel_event=None, allowed_refs=None):
         started = time.monotonic()
         with self._lock:
             self._active += 1
             self._last_usage = None
-        body = {"model": self.model, "messages": [{"role": "system", "content": instructions},
-                {"role": "user", "content": prompt}], "stream": True, "stream_options": {"include_usage": True}}
-        if max_tokens is not None:
-            body["max_tokens"] = max_tokens
+        cancel_watch_stop = threading.Event()
+        cancel_watcher = None
+        current_response = [None]
         try:
+            _check_cancelled(cancel_event)
+            content = prompt
+            if images is not None:
+                content = [{"type": "text", "text": prompt}]
+                for image in images:
+                    _check_cancelled(cancel_event)
+                    # Files have already been validated/normalized by the server.
+                    encoded = base64.b64encode(Path(image["path"]).read_bytes()).decode("ascii")
+                    content.extend([{"type": "text", "text": image["id"]},
+                                    {"type": "image_url", "image_url": {
+                                        "url": "data:" + image["mime_type"] + ";base64," + encoded}}])
+            body = {"model": self.model, "messages": [{"role": "system", "content": instructions},
+                    {"role": "user", "content": content}], "stream": True, "stream_options": {"include_usage": True}}
+            if max_tokens is not None:
+                body["max_tokens"] = max_tokens
+            _check_cancelled(cancel_event)
             # No redirects, SDK retries, environment proxies, cookies, or tools.
             with httpx.Client(timeout=self.timeout, follow_redirects=False, trust_env=False,
                               transport=self._transport) as client:
+                if cancel_event is not None:
+                    def watch_cancel():
+                        while not cancel_watch_stop.wait(.05):
+                            if cancel_event.is_set():
+                                # Best effort: close the current socket/stream to
+                                # unblock reads. This cannot undo remote billing.
+                                response = current_response[0]
+                                for resource in (response, client):
+                                    if resource is not None:
+                                        try:
+                                            resource.close()
+                                        except Exception:
+                                            pass
+                                return
+                    cancel_watcher = threading.Thread(target=watch_cancel, daemon=True,
+                                                       name="classroom-api-cancel")
+                    cancel_watcher.start()
+                _check_cancelled(cancel_event)
                 with client.stream("POST", self.base_url + "/chat/completions", json=body,
                                    headers={"Authorization": "Bearer " + self._api_key,
                                             "Accept": "text/event-stream, application/json"}) as response:
+                    current_response[0] = response
+                    _check_cancelled(cancel_event)
                     code = response.status_code
                     if not 200 <= code < 300:
                         kind = "auth" if code in (401, 403) else "quota" if code in (402, 429) else "timeout" if code in (408, 504) else "network" if code >= 500 else "other"
+                        if images and code in (400, 415, 422):
+                            diagnostic = self._error_diagnostic(response, started, cancel_event)
+                            if _vision_unsupported(diagnostic):
+                                kind = "vision_unsupported"
                         raise _failure(kind)
-                    answer = self._read_response(response, started, emit)
-            if set(_REFERENCE.findall(answer)) - set(_REFERENCE.findall(source)):
-                raise _failure(message="AI 返回了无法对应课堂原文的引用，本次回答未采用，请重试。")
+                    answer = self._read_response(response, started, emit, cancel_event)
+            _check_cancelled(cancel_event)
+            _validate_references(answer, source, allowed_refs)
             with self._lock:
                 self._inference_verified = True
                 self._last_success_at = time.time()
@@ -235,23 +293,41 @@ class ApiBridge(CodexBridge):
         except (httpx.NetworkError, httpx.RemoteProtocolError, httpx.ProxyError):
             error = _failure("network")
         except CodexBridgeError as caught:
-            error = caught
+            error = _failure(caught.kind, str(caught))
         except Exception:
             # Never serialize raw HTTP errors, response data or callback errors.
             error = _failure()
         finally:
+            cancel_watch_stop.set()
+            if cancel_watcher is not None:
+                cancel_watcher.join(timeout=.2)
             with self._lock:
                 self._active -= 1
                 self._last_seconds = round(time.monotonic() - started, 2)
+        if cancel_event is not None and cancel_event.is_set():
+            error = _failure("cancelled")
         with self._lock:
             self._last_error, self._last_error_kind = str(error), error.kind
         raise error from None
 
-    def _lines(self, response, started):
+    def _error_diagnostic(self, response, started, cancel_event):
+        """Read a small private error prefix, solely for capability detection."""
+        chunks = bytearray()
+        for chunk in response.iter_bytes():
+            _check_cancelled(cancel_event)
+            if time.monotonic() - started > self.timeout:
+                raise _failure("timeout")
+            chunks.extend(chunk[:32768 - len(chunks)])
+            if len(chunks) >= 32768:
+                break
+        return chunks.decode("utf-8", errors="replace")
+
+    def _lines(self, response, started, cancel_event=None):
         decoder = codecs.getincrementaldecoder("utf-8")("strict")
         buffer = ""
         size = 0
         for chunk in response.iter_bytes():
+            _check_cancelled(cancel_event)
             if time.monotonic() - started > self.timeout:
                 raise _failure("timeout")
             size += len(chunk)
@@ -259,14 +335,16 @@ class ApiBridge(CodexBridge):
                 raise _failure(message="API 返回的内容过长，本次回答未采用。")
             buffer += decoder.decode(chunk)
             while "\n" in buffer:
+                _check_cancelled(cancel_event)
                 line, buffer = buffer.split("\n", 1)
                 yield line.rstrip("\r")
         buffer += decoder.decode(b"", final=True)
+        _check_cancelled(cancel_event)
         if buffer:
             yield buffer.rstrip("\r")
 
-    def _read_response(self, response, started, emit):
-        lines = self._lines(response, started)
+    def _read_response(self, response, started, emit, cancel_event=None):
+        lines = self._lines(response, started, cancel_event)
         # Some compatible services return JSON even when stream=true.
         first = next(lines, "").lstrip("\ufeff")
         while not first.strip():
@@ -278,7 +356,7 @@ class ApiBridge(CodexBridge):
             payload = json.loads("\n".join([first, *lines]))
             answer = self._read_json(payload)
             if emit:
-                self._emit(answer)
+                self._emit(answer, cancel_event)
             return answer
         data_lines = []
         answer_parts = []
@@ -288,6 +366,7 @@ class ApiBridge(CodexBridge):
 
         def consume():
             nonlocal finished, done, answer_size
+            _check_cancelled(cancel_event)
             if not data_lines:
                 return
             data = "\n".join(data_lines)
@@ -319,13 +398,14 @@ class ApiBridge(CodexBridge):
                         raise _failure(message="API 返回的内容过长，本次回答未采用。")
                     answer_parts.append(content)
                     if emit:
-                        self._emit(content)
+                        self._emit(content, cancel_event)
                 reason = choice.get("finish_reason")
                 if reason is not None:
                     self._check_finish(reason)
                     finished = True
 
         for line in _prepend(first, lines):
+            _check_cancelled(cancel_event)
             if line == "":
                 consume()
             elif line.startswith("data:"):

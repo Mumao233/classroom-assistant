@@ -16,8 +16,8 @@ class SyntheticBridge(FakeBridge):
 
 
 @contextmanager
-def serve(data):
-    application = create_app({}, data, engine=FakeASR(), bridge=SyntheticBridge())
+def serve(data, bridge=None):
+    application = create_app({}, data, engine=FakeASR(), bridge=bridge or SyntheticBridge())
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]

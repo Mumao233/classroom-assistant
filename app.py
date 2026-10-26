@@ -15,22 +15,24 @@ import wave
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 
 from asr import ASREngine
-from codex_bridge import CodexBridge, CodexBridgeError
+from codex_bridge import CodexBridge, CodexBridgeError, _validate_references
 from ai_settings import AISettings, empty_usage, record_usage
 from version import __version__
 from classroom_features import ClassroomFeatures, wav_duration
 from course_catalog import glossary_terms, validate_glossary
 from session_order import creation_order, newest_first
 from input_limits import INPUT_LIMITS, require_content, validation_message
+from study_workflow import StudyWorkflow
 
 ROOT = Path(__file__).resolve().parent
 
@@ -87,7 +89,7 @@ def source_line(seg):
     return f"[{seg['id']}] {classroom_time(seg['start'])}–{classroom_time(seg['end'])} {seg['text']}"
 
 
-class Classroom(ClassroomFeatures):
+class Classroom(StudyWorkflow, ClassroomFeatures):
     def __init__(self, data: Path, config: dict, engine=None, bridge=None):
         self.data = data
         data.mkdir(parents=True, exist_ok=True)
@@ -113,13 +115,14 @@ class Classroom(ClassroomFeatures):
         self.closed = threading.Event()
         self.threads = []
         self.warnings = []
+        self.init_study()
         self.init_features()
         for path in sorted(data.glob("*/session.json")):
             try:
                 s = json.loads(path.read_text(encoding="utf-8"))
                 if s.get("id") != path.parent.name:
                     raise ValueError("session id mismatch")
-                for key in ("segments", "groups", "questions", "audio", "revisions"):
+                for key in ("segments", "groups", "questions", "audio", "revisions", "slides"):
                     s.setdefault(key, [])
                 s.setdefault("settings", {"terms": "", "auto_analyze": True})
                 s.setdefault("pending_ids", [])
@@ -177,7 +180,7 @@ class Classroom(ClassroomFeatures):
             sid = uuid.uuid4().hex
             s = {"id": sid, "title": title[:160] or "新的课堂", "created_at": stamp(),
                  "creation_order": max((creation_order(existing) for existing in self.sessions.values()), default=0) + 1,
-                 "demo": demo, "segments": [], "groups": [], "questions": [], "audio": [], "revisions": [], "course_id": None,
+                 "demo": demo, "segments": [], "groups": [], "questions": [], "audio": [], "revisions": [], "slides": [], "course_id": None,
                  "settings": {"terms": "", "auto_analyze": not demo and self.connection.values["provider"] != "api"}, "pending_ids": [],
                  "ai_usage": empty_usage(),
                  "flush_requested": False, "last_text_at": 0}
@@ -199,7 +202,7 @@ class Classroom(ClassroomFeatures):
             newest = max((a["start"] + a["duration"] for a in active["audio"]), default=0)
             lag = max(0, newest - min((a["start"] for a in remaining), default=newest))
             soundcheck = {k: v for k, v in self.soundcheck.items() if k not in ("path", "prompt")}
-            return {"session": copy.deepcopy(active),
+            return {"session": self.study_session_public(active),
                     "courses": copy.deepcopy(self.courses), "ai": copy.deepcopy(self.ai), "soundcheck": soundcheck,
                     "sessions": [{k: s[k] for k in ("id", "title", "created_at", "demo")} for s in newest_first(self.sessions.values())],
                     "status": {"asr": asr_status, "codex": codex_status, "ai": self.ai_status(codex_status)},
@@ -215,7 +218,7 @@ class Classroom(ClassroomFeatures):
         with self.lock:
             values = self.connection.public()
             current = self.active_ai or {"provider": values["provider"], "model": values["model"] if values["provider"] == "api" else self.config.get("codex_model")}
-            return {**values, "pending": self.ai_switch_pending,
+            return {**values, "pending": self.ai_switch_pending, "busy": self.study_busy(),
                     "active_provider": current["provider"], "active_model": current.get("model")}
 
     def ai_status(self, codex_status=None):
@@ -235,6 +238,8 @@ class Classroom(ClassroomFeatures):
             try:
                 desired, key = self.connection.prepare(payload)
                 routing_changed = any(desired[k] != self.connection.values[k] for k in ("provider", "base_url", "model")) or key != self.connection.key
+                if routing_changed and self.study_busy() and not payload.get("force"):
+                    raise HTTPException(409, "正在加载，暂不能更换 AI 接入；可选择强制更换并重新确认发送目的地。")
                 if routing_changed:
                     has_waiting = any(j["kind"] in ("question", "analysis", "glossary") and j["status"] in ("pending", "paused", "running") for j in self.jobs.values())
                     keep_paused = bool(self.active_ai or has_waiting or self.ai["paused"])
@@ -249,6 +254,7 @@ class Classroom(ClassroomFeatures):
                             self.save(session)
                 self.connection.save(payload)
                 if routing_changed:
+                    self.invalidate_study_destination()
                     self.api_last_status = {}
                     if not keep_paused:
                         resumed = {**self.ai, "paused": False, "kind": None, "reason": None}
@@ -258,7 +264,7 @@ class Classroom(ClassroomFeatures):
             except CodexBridgeError as exc:
                 raise HTTPException(400, str(exc)) from None
             except OSError:
-                raise HTTPException(507, "本机存储写入失败，设置保存未完成；AI 队列保持暂停，请检查存储后重新保存或恢复原接入。") from None
+                raise HTTPException(507, "本机存储写入失败，设置可能已部分保存；AI 队列保持暂停，请重新查看当前接入，再检查存储后重试。") from None
             return self.ai_settings()
 
     def test_ai(self, payload):
@@ -529,11 +535,22 @@ class Classroom(ClassroomFeatures):
             item = next((i for i in collection if i["id"] == item_id), None)
             if not item:
                 raise HTTPException(404, "找不到这条记录。")
+            if item.get("study"):
+                raise HTTPException(409, "图文与即时解释须先检查原快照及发送目的地，请使用该条记录的确认重试入口。")
             if item["status"] in ("pending", "running"):
                 raise HTTPException(409, "这一项正在处理。")
             result = self._enqueue_ai(s, item, kind)
             self.save(s)
             return copy.deepcopy(result)
+
+    def _pause_ai_storage(self):
+        reason = '本机保存失败，AI 已暂停；最新结果尚未保存，可能只在内存中，请勿退出。检查磁盘后显式恢复，保存成功前不要关闭后台。'
+        try:
+            self._pause_ai('storage', reason)
+        except OSError:
+            # _pause_ai updates all in-memory states before touching disk.
+            # A full disk must not kill the worker or trigger another paid call.
+            pass
 
     def _ai_loop(self):
         while not self.closed.is_set():
@@ -550,10 +567,24 @@ class Classroom(ClassroomFeatures):
                 if item.get("job_id") != jid or item.get("status") != "pending" or self.ai["paused"]:
                     self.ai_queue.task_done()
                     continue
+                if item.get("study") and (item.get("destination", {}).get("token") != self.study_route or not item.get("confirmed_at")):
+                    item.update(status="prepared", error="接入已变化，请重新确认目的地后发送。")
+                    self.jobs[jid]["status"] = "superseded"
+                    item.pop("job_id", None)
+                    try:
+                        self.save(s)
+                    except OSError:
+                        self._pause_ai_storage()
+                    self.ai_queue.task_done()
+                    continue
                 item["status"] = self.jobs[jid]["status"] = "running"
                 provider = self.connection.values["provider"]
                 model = self.connection.values["model"] if provider == "api" else self.config.get("codex_model")
                 self.active_ai = {"provider": provider, "model": model}
+                self.active_cancel = threading.Event()
+                cancel_event = self.active_cancel
+                request_token = self.study_route
+                image_count = len(item.get("evidence", {}).get("slides", []))
                 item.update(stream_provider=provider, stream_model=model)
                 if provider == "api" and kind != "glossary":
                     item.update(streaming_text="", stream_status="streaming")
@@ -579,11 +610,9 @@ class Classroom(ClassroomFeatures):
                 elif kind == "glossary":
                     context = ""
                     glossary_name, syllabus = item["name"], item.get("syllabus", "")
-                    self.save_courses()
                 else:
                     context = item.get("context_snapshot") or self.context(s, item.get("question", ""), item.get("group_id"))
                 history = item.get("history_snapshot", [])
-                self.save(s)
             began = time.monotonic()
             last_draft_save = [0.0]
             request_bridge = self.bridge
@@ -601,6 +630,12 @@ class Classroom(ClassroomFeatures):
                         self.save(s)
                         last_draft_save[0] = time.monotonic()
             try:
+                with self.lock:
+                    self.save(s)
+                    if kind == 'glossary':
+                        self.save_courses()
+                # Resolve immutable assets before any provider submission or usage count.
+                images = self.study_images(s, item) if item.get("study") else []
                 if provider == "api":
                     # Snapshot destination and credential before releasing the
                     # queue lock; changing settings cannot redirect this call.
@@ -616,6 +651,14 @@ class Classroom(ClassroomFeatures):
                     result = request_bridge.analyze(context, raw)
                 elif kind == "glossary":
                     result = validate_glossary(request_bridge.generate_glossary(glossary_name, syllabus))
+                elif item.get("study"):
+                    if not hasattr(request_bridge, "ask_visual"):
+                        raise CodexBridgeError("当前接入尚未提供图文解释能力，请检查版本。")
+                    result = request_bridge.ask_visual(context, item["question"], images,
+                                explain=item.get("explain", False), cancel_event=cancel_event)
+                    # Ordinary lecture text may itself mention an S/P-shaped
+                    # identifier. Only actual receipt sources authorize citations.
+                    _validate_references(result, context, set(item['evidence']['source_ids']))
                 else:
                     result = request_bridge.ask(context, item["question"], history)
                 if provider == "api":
@@ -625,6 +668,10 @@ class Classroom(ClassroomFeatures):
                     if api_attempt:
                         record_usage(s["ai_usage"], metadata, True)
                         usage_recorded = True
+                    if item.get("job_id") != jid:
+                        continue
+                    if item.get("study"):
+                        self.record_study_vision(request_token, image_count, True)
                     item.update(status="done", elapsed=round(time.monotonic()-began, 2))
                     item.update(ai_provider=provider, ai_model=metadata.get("model"), usage=metadata.get("usage"),
                                 stream_status="complete", streaming_text="")
@@ -640,15 +687,24 @@ class Classroom(ClassroomFeatures):
                     if api_attempt and not usage_recorded:
                         record_usage(s["ai_usage"], request_bridge.metadata(), False)
                         usage_recorded = True
-                    error = str(exc)[:400] if isinstance(exc, CodexBridgeError) else "AI 暂时无法完成回答，请检查设置后重试。"
-                    error_kind = getattr(exc, "kind", "other")
-                    paused = error_kind in ("network", "quota", "auth", "timeout")
+                    if item.get("job_id") != jid:
+                        continue
+                    error = ('本机存储写入失败，请检查磁盘后恢复；未自动重发。' if isinstance(exc, OSError)
+                             else str(exc)[:400] if isinstance(exc, CodexBridgeError)
+                             else "AI 暂时无法完成回答，请检查设置后重试。")
+                    error_kind = 'storage' if isinstance(exc, OSError) else getattr(exc, "kind", "other")
+                    if item.get("study") and error_kind == "vision_unsupported":
+                        self.record_study_vision(request_token, image_count, False)
+                    paused = error_kind in ("network", "quota", "auth", "timeout", "storage")
                     item.update(status="paused" if paused else "error", error=error, error_kind=error_kind)
                     if provider == "api" and kind != "glossary":
                         item["stream_status"] = "interrupted"
                     self.jobs[jid].update(status=item["status"], error=error)
                     if paused:
-                        self._pause_ai(error_kind, error)
+                        try:
+                            self._pause_ai(error_kind, error)
+                        except OSError:
+                            self._pause_ai_storage()
             finally:
                 with self.lock:
                     if api_attempt and not usage_recorded:
@@ -658,10 +714,14 @@ class Classroom(ClassroomFeatures):
                                                 "last_error": None if success else item.get("error"),
                                                 "last_error_kind": None if success else item.get("error_kind")}
                     self.active_ai = None
+                    self.active_cancel = None
                     self.ai_switch_pending = False
-                    self.save(s)
-                    if kind == "glossary":
-                        self.save_courses()
+                    try:
+                        self.save(s)
+                        if kind == "glossary":
+                            self.save_courses()
+                    except OSError:
+                        self._pause_ai_storage()
                 self.ai_queue.task_done()
 
     def _idle_loop(self):
@@ -705,6 +765,7 @@ class Classroom(ClassroomFeatures):
         for q in s["questions"]:
             lines += [f"### {q['question']}", "", q.get("answer") or q.get("error") or "尚未回答。", ""]
             lines += self.ai_export_lines(q)
+            lines += self.study_export_lines(q)
             if q.get("stale"):
                 lines += [q.get("stale_reason") or "回答依据后来有修改，请核对。", ""]
         for index, revision in enumerate(s.get("revisions", []), 1):
@@ -787,6 +848,45 @@ class AISettingsInput(BaseModel):
     api_key: str | None = Field(default=None, max_length=4096)
     remember_key: bool | None = None
     clear_key: bool = False
+    force: bool = False
+
+
+class SlideIntervalInput(SessionInput):
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    title: str | None = Field(default=None, max_length=160)
+
+
+class SeenSegment(BaseModel):
+    id: str = Field(max_length=80)
+    version: int = Field(default=0, ge=0, strict=True)
+
+
+class SeenSlide(BaseModel):
+    id: str = Field(max_length=80)
+    sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    start: float = Field(ge=0, allow_inf_nan=False)
+    end: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    title: str = Field(default='', max_length=160)
+
+
+class StudyInput(SessionInput):
+    mode: Literal['recent30', 'recent120', 'group'] = 'recent120'
+    anchor: float = Field(ge=0, allow_inf_nan=False)
+    group_id: str | None = Field(default=None, max_length=80)
+    question: str = Field(default='', max_length=INPUT_LIMITS['question'])
+    explain: bool = False
+    slide_ids: list[str] | None = Field(default=None, max_length=4)
+    include_images: bool = True
+    seen_segments: list[SeenSegment] | None = Field(default=None, max_length=20000)
+    seen_slides: list[SeenSlide] | None = Field(default=None, max_length=2000)
+    seen_group_segment_ids: list[str] | None = Field(default=None, max_length=20000)
+
+
+class StudySendInput(SessionInput):
+    destination_token: str = Field(min_length=1, max_length=128)
+    confirm_images: bool = False
+    remember: bool = False
 
 
 def create_app(config=None, data=None, engine=None, bridge=None):
@@ -846,6 +946,42 @@ def create_app(config=None, data=None, engine=None, bridge=None):
     @app.post("/api/ai/test")
     def test_ai(body: AISettingsInput):
         return room.test_ai(body.model_dump(exclude_none=True))
+
+    @app.post('/api/slides')
+    async def add_slide(request: Request, session_id: str, start: float, title: str = ''):
+        chunks = bytearray()
+        async for chunk in request.stream():
+            if len(chunks) + len(chunk) > 10 * 1024 * 1024:
+                raise HTTPException(413, '每张课件图片最多 10 MiB，请缩小图片后重试。')
+            chunks.extend(chunk)
+        if len(title) > 160:
+            raise HTTPException(422, '课件名称最多 160 个字符。')
+        return await run_in_threadpool(room.add_slide, bytes(chunks), start=start, sid=session_id, title=title)
+
+    @app.patch('/api/slides/{pid}')
+    def update_slide(pid: str, body: SlideIntervalInput):
+        return room.update_slide(pid, body.model_dump())
+
+    @app.get('/api/slides/{pid}')
+    def slide_file(pid: str, session_id: str):
+        path, mime = room.slide_file(pid, session_id)
+        return FileResponse(path, media_type=mime)
+
+    @app.post('/api/study/prepare')
+    def prepare_study(body: StudyInput):
+        return room.prepare_study(body.model_dump())
+
+    @app.post('/api/study/{qid}/send')
+    def send_study(qid: str, body: StudySendInput):
+        return room.send_study(qid, body.model_dump())
+
+    @app.post('/api/study/{qid}/retry')
+    def retry_study(qid: str, body: SessionInput):
+        return room.clone_study(qid, body.session_id)
+
+    @app.post('/api/study/{qid}/text-only')
+    def text_only_study(qid: str, body: SessionInput):
+        return room.clone_study(qid, body.session_id, text_only=True)
 
     @app.post("/api/mode")
     def mode(body: ModeInput):
