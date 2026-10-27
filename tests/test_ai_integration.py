@@ -76,7 +76,7 @@ def test_settings_and_export_never_reveal_key(local_client):
         assert "synthetic-only-secret" not in response.text
     for path in room.data.rglob("*.json"):
         assert "synthetic-only-secret" not in path.read_text(encoding="utf-8")
-    assert client.get("/api/health").json()["version"] == "1.2.0"
+    assert client.get("/api/health").json()["version"] == "1.2.1"
 
 
 def test_secret_not_echoed_on_validation_failure(local_client):

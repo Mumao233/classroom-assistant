@@ -4,8 +4,11 @@ const assert = require('assert/strict');
 const fs = require('fs');
 const path = require('path');
 const vm = require('vm');
+let testCompleted = false;
+process.once('beforeExit', () => { if (!testCompleted) { console.error('study-ui failed: asynchronous test did not finish (unresolved promise)'); process.exitCode = 1; } });
 const html = fs.readFileSync(path.resolve(__dirname, '../static/index.html'), 'utf8');
 const source = fs.readFileSync(path.resolve(__dirname, '../static/app.js'), 'utf8');
+const cacheSource = fs.readFileSync(path.resolve(__dirname, '../static/study-cache.js'), 'utf8');
 const elements = new Map();
 class Element {
   constructor(tag = 'DIV') {
@@ -61,10 +64,17 @@ let settingsGate = null;
 let prepareFailure = null;
 let sendFailure = null;
 let uploadFailure = null;
+let uploadLostResponse = false;
+let legacyLostResponse = false;
+let studySendLostResponse = false;
+let legacyRetryLostResponse = false;
+let uploadGate = null;
 let knownVision = 'unknown';
 let remembered = false;
 let microphoneCalls = 0;
-const slides = [1, 2].map((index) => ({ id: `P${index}`, title: `Slide ${index}`, start: 0, end: null, path: 'ignored/file.png', mime_type: 'image/png' }));
+const slideReceipts = new Map(), studyReceipts = new Map(), legacyReceipts = new Map();
+const knownSessions = new Map();
+const slides = [1, 2].map((index) => ({ id: `P${index}`, title: `Slide ${index}`, start: 0, end: null, version: 1, sha256: String(index).repeat(64), path: 'ignored/file.png', mime_type: 'image/png' }));
 const server = {
   input_limits: { text: 12000, question: 4000, syllabus: 12000 },
   session: { id: 'synthetic-session', title: 'Synthetic lecture', settings: { terms: '', auto_analyze: false }, slides, segments: [{ id: 'S1', start: 20, end: 50, text: 'Frozen original source.' }], groups: [], questions: [], audio: [], revisions: [] },
@@ -75,10 +85,11 @@ const server = {
 };
 const destination = () => ({ provider: server.ai_settings.provider, label: 'Synthetic AI', base_url: server.ai_settings.base_url, model: server.ai_settings.model, token: `token-${server.ai_settings.model}` });
 function makePrepared(params, oldEvidence = null) {
-  const selected = params.include_images ? server.session.slides.filter((item) => params.slide_ids ? params.slide_ids.includes(item.id) : true) : [];
+  const session = knownSessions.get(params.session_id) || server.session;
+  const selected = params.include_images ? session.slides.filter((item) => params.slide_ids ? params.slide_ids.includes(item.id) : true) : [];
   const range = { start: Math.max(0, params.anchor - (params.mode === 'recent30' ? 30 : 120)), end: params.anchor };
-  const question = { id: `Q${++preparedCounter}`, study: true, status: 'prepared', question: params.question || 'Explain what I just heard.', explain: params.explain, request_params: clone(params), evidence: oldEvidence ? clone(oldEvidence) : { requested_range: range, actual_range: { start: 20, end: 50 }, segments: clone(server.session.segments), slides: clone(selected), incomplete: true, warnings: [] }, destination: destination(), requires_confirmation: Boolean(selected.length && !remembered), vision: { state: knownVision } };
-  server.session.questions.push(question);
+  const question = { id: `Q${++preparedCounter}`, request_id: params.request_id, study: true, status: 'prepared', question: params.question || 'Explain what I just heard.', explain: params.explain, request_params: clone(params), evidence: oldEvidence ? clone(oldEvidence) : { requested_range: range, actual_range: { start: 20, end: 50 }, segments: clone(session.segments), slides: clone(selected), incomplete: true, warnings: [] }, destination: destination(), requires_confirmation: Boolean(selected.length && !remembered), vision: { state: knownVision }, source_status: { token: 'source-original', changed: false, unavailable: false, messages: [], slides: [] } };
+  session.questions.push(question);
   return question;
 }
 const context = vm.createContext({
@@ -94,30 +105,47 @@ const context = vm.createContext({
     requests.push({ url, method, body });
     let result;
     let failure;
-    if (url === '/api/state') result = server;
+    if (url === '/api/state') { knownSessions.set(server.session.id, server.session); result = server; }
     else if (url === '/api/settings') { if (settingsGate) await settingsGate; result = {}; }
-    else if (url === '/api/ask') { result = { id: 'TEXT' }; }
+    else if (url.startsWith('/api/requests/')) { const id = new URL(`http://localhost${url}`).pathname.split('/').at(-1); result = legacyReceipts.has(id) ? { found: true, question: legacyReceipts.get(id) } : { found: false }; }
+    else if (url === '/api/ask') { result = { id: 'TEXT' }; legacyReceipts.set(body.request_id, result); if (legacyLostResponse) { const error = Error('Synthetic dropped reply'); error.name = 'AbortError'; throw error; } }
+    else if (/^\/api\/groups\/[^/]+\/retry$/.test(url)) { result = { id: 'retry-job', status: 'pending' }; legacyReceipts.set(body.request_id, result); if (legacyRetryLostResponse) { const error = Error('Synthetic dropped retry reply'); error.name = 'AbortError'; throw error; } }
     else if (url === '/api/ai/settings' && method === 'PUT') { Object.assign(server.ai_settings, body); result = server.ai_settings; }
     else if (url === '/api/study/prepare') {
       if (prepareGate) await prepareGate;
       failure = prepareFailure;
-      if (!failure) result = makePrepared(body);
+      if (!failure) { result = makePrepared(body); studyReceipts.set(body.request_id, result); }
+    } else if (url.startsWith('/api/study/requests/')) {
+      const id = new URL(`http://localhost${url}`).pathname.split('/').at(-1);
+      result = studyReceipts.has(id) ? { found: true, question: studyReceipts.get(id) } : { found: false };
+    } else if (url.startsWith('/api/slides/requests/')) {
+      const id = new URL(`http://localhost${url}`).pathname.split('/').at(-1);
+      result = slideReceipts.has(id) ? { found: true, slide: slideReceipts.get(id), available: true } : { found: false };
     } else if (/^\/api\/slides\?/.test(url)) {
+      if (uploadGate) await uploadGate;
       failure = uploadFailure;
-      if (!failure) { const query = new URL(`http://localhost${url}`).searchParams; result = { id: 'P3', title: query.get('title'), start: Number(query.get('start')), end: null }; server.session.slides.push(result); }
+      if (!failure) { const query = new URL(`http://localhost${url}`).searchParams; const session = knownSessions.get(query.get('session_id')) || server.session; result = { id: `P${session.slides.length + 1}`, title: query.get('title'), start: Number(query.get('start')), end: null, version: 1, sha256: 'c'.repeat(64) }; session.slides.push(result); slideReceipts.set(query.get('request_id'), result); if (uploadLostResponse) { const error = Error('Synthetic dropped upload reply'); error.name = 'AbortError'; throw error; } }
+    } else if (/^\/api\/slides\/[^/]+\/rotate$/.test(url)) {
+      const slide = server.session.slides.find((item) => url.split('/')[3] === item.id); slide.version = (slide.version || 1) + 1; slide.sha256 = 'd'.repeat(64); result = slide; slideReceipts.set(body.request_id, result);
+    } else if (/^\/api\/slides\//.test(url) && method === 'DELETE') {
+      server.session.slides.find((item) => new URL(`http://localhost${url}`).pathname.endsWith(item.id)).removed = true; result = {};
     } else if (/^\/api\/slides\//.test(url) && method === 'PATCH') { Object.assign(server.session.slides.find((item) => url.endsWith(item.id)), body); result = {}; }
-    else if (/^\/api\/study\//.test(url)) {
+    else if (/^\/api\/study\/[^/?]+\?/.test(url) && method === 'GET') {
+      const uri = new URL(`http://localhost${url}`); const session = knownSessions.get(uri.searchParams.get('session_id')) || server.session;
+      result = session.questions.find((item) => item.id === uri.pathname.split('/').at(-1));
+    } else if (/^\/api\/study\//.test(url)) {
       const [, id, action] = url.match(/^\/api\/study\/([^/]+)\/(send|retry|text-only)$/) || [];
       const question = server.session.questions.find((item) => item.id === id);
       assert.ok(question, `Question ${id} exists`);
-      if (action === 'send') { failure = sendFailure; if (!failure) { question.status = 'pending'; result = question; } }
-      else { result = makePrepared(question.request_params, question.evidence); if (action === 'text-only') { result.evidence.slides = []; result.requires_confirmation = false; } }
+      if (action === 'send') { failure = sendFailure; if (!failure) { question.status = 'pending'; result = question; if (studySendLostResponse) { const error = Error('Synthetic dropped study send reply'); error.name = 'AbortError'; throw error; } } }
+      else { result = makePrepared(question.request_params, question.evidence); if (question.result_unknown || question.duplicate_billing_risk) result.duplicate_billing_risk = true; if (action === 'text-only') { result.evidence.slides = []; result.requires_confirmation = false; } studyReceipts.set(body.request_id, result); }
     } else throw Error(`Unexpected mock request ${method} ${url}`);
     return failure ? { ok: false, status: failure.status, json: async () => ({ detail: failure.detail }) } : { ok: true, status: 200, json: async () => clone(result) };
   },
 });
-const testSource = source.replace('  initialize().catch((error) => toast(error.message, true));', '  globalThis.test = { state, poll, render, prepareStudy, frozenStudyParams, classroomAnchor, renderStudyReview, openStudyReview, confirmStudy, retryStudy, refreshStudy, uploadSlide, editSlide, renderSlides, fillAIForm, submitAISettings };');
+const testSource = source.replace('  initialize().catch((error) => toast(error.message, true));', '  globalThis.test = { state, poll, render, prepareStudy, frozenStudyParams, classroomAnchor, renderStudyReview, openStudyReview, confirmStudy, retryStudy, refreshStudy, uploadSlide, editSlide, renderSlides, fillAIForm, submitAISettings, recoverSlide, clearPendingSlide, ensureStudyCache, previewRotation, saveRotation, removeSlide, submitLegacyQuestion, api };');
 assert.notEqual(testSource, source);
+vm.runInContext(cacheSource, context);
 vm.runInContext(testSource, context);
 const app = context.test;
 const calls = (suffix) => requests.filter((request) => request.url.endsWith(suffix));
@@ -128,6 +156,19 @@ function button(dataset) { const item = new Element('BUTTON'); item.dataset = da
 (async () => {
   app.state.queueLoaded = true;
   await app.poll();
+  const originalSession = server.session;
+  $('#question-input').value = 'Only class A may see this draft';
+  await trigger($('#question-input'), 'input');
+  await trigger($('#transcript-list'), 'click', { target: button({ editSegment: 'S1' }) });
+  assert.equal($('#edit-segment-dialog').open, true);
+  server.session = { ...clone(originalSession), id: 'class-B', title: 'Second synthetic class', questions: [] };
+  await app.poll();
+  assert.equal($('#question-input').value, '', 'switching classes must never carry another class draft');
+  assert.equal($('#edit-segment-dialog').open, false, 'switching classes closes the original transcript editor');
+  server.session = originalSession;
+  await app.poll();
+  assert.equal($('#question-input').value, 'Only class A may see this draft', 'returning to class restores its own draft');
+  $('#question-input').value = ''; await trigger($('#question-input'), 'input');
   assert.equal($('#include-slides').checked, true, 'slides enable image context by default');
   app.state.capture = { kind: 'classroom', segmenter: { time: 88.25 } };
   app.state.clockSeconds = 120;
@@ -317,7 +358,7 @@ function button(dataset) { const item = new Element('BUTTON'); item.dataset = da
   releaseFrozenPrepare(); await frozenClick; prepareGate = null;
   const frozenBody = calls('/prepare').at(-1).body;
   assert.deepEqual(frozenBody.seen_segments, [{ id: 'Sfreeze', version: 2 }], 'capture source versions before saving settings');
-  assert.deepEqual(frozenBody.seen_slides, [{ id: 'Pfreeze', sha256: 'original-image-hash', start: 10, end: 30, title: 'Original slide' }], 'capture image association before saving settings');
+  assert.deepEqual(frozenBody.seen_slides, [{ id: 'Pfreeze', version: 1, interval_version: 0, sha256: 'original-image-hash', start: 10, end: 30, title: 'Original slide' }], 'capture image association before saving settings');
   assert.equal(frozenBody.group_id, 'Gfreeze', 'the latest already-visible group is fixed at click time');
   assert.deepEqual(frozenBody.seen_group_segment_ids, ['Sfreeze'], 'late group members cannot enter the old selection');
   assert.ok(!JSON.stringify(frozenBody).includes('Version two'), 'metadata never supplies client-authored transcript text');
@@ -363,6 +404,213 @@ function button(dataset) { const item = new Element('BUTTON'); item.dataset = da
   await trigger(quickButtons[2], 'click');
   assert.equal(calls('/prepare').length, callsBeforeEmptyGroup, 'no visible group cannot be replaced by one arriving after the click');
   assert.match($('#study-status').textContent, /还没有可选的意群/);
+
+  // v1.2.1: durable upload identity, lost responses, and late callbacks.
+  const recoveryA = { id: 'recovery-A', title: 'Recovery A', settings: { terms: '', auto_analyze: false }, slides: clone(slides.slice(0, 2)), segments: [{ id: 'RS1', version: 0, start: 0, end: 40, text: 'Recovery source' }], groups: [], questions: [], audio: [], revisions: [] };
+  const recoveryB = { ...clone(recoveryA), id: 'recovery-B', title: 'Recovery B', slides: [], questions: [] };
+  server.session = recoveryA; await app.poll();
+  app.state.clockSeconds = 61;
+  const recoveryImage = new Blob(['retained pixels'], { type: 'image/png' });
+  uploadFailure = { status: 422, detail: 'Synthetic decoding rejection' };
+  await app.uploadSlide(recoveryImage);
+  const failedRecord = app.state.cachedSlides.find((item) => item.session_id === recoveryA.id);
+  assert.ok(failedRecord && failedRecord.blob === recoveryImage, 'failed upload retains its Blob in the cache');
+  assert.equal(failedRecord.start, 61);
+  assert.match($('#pending-slides-list').innerHTML, /data-upload-retry/);
+  assert.equal($('#pending-slides-panel').hidden, false);
+  uploadFailure = null; app.state.clockSeconds = 999;
+  const retryRequestStart = requests.length;
+  await app.recoverSlide(failedRecord);
+  const recoveryRequests = requests.slice(retryRequestStart);
+  assert.match(recoveryRequests[0].url, /\/api\/slides\/requests\//, 'retry looks up first');
+  const retriedUpload = recoveryRequests.find((item) => item.method === 'POST');
+  assert.ok(retriedUpload.url.includes(`request_id=${failedRecord.id}`));
+  assert.match(retriedUpload.url, /start=61/);
+  assert.match(retriedUpload.url, /session_id=recovery-A/);
+  assert.ok(!app.state.cachedSlides.some((item) => item.id === failedRecord.id), 'cached Blob is cleared only after available receipt');
+
+  uploadLostResponse = true;
+  await app.uploadSlide(recoveryImage);
+  const lostRecord = app.state.cachedSlides.find((item) => item.session_id === recoveryA.id);
+  assert.ok(lostRecord, 'dropped response retains recoverable image');
+  assert.match($('#slide-status').textContent, /请求超时、无法确定服务商是否已处理/);
+  const uploadsBeforeLookup = requests.filter((item) => item.url.startsWith('/api/slides?')).length;
+  uploadLostResponse = false; await app.recoverSlide(lostRecord);
+  assert.equal(requests.filter((item) => item.url.startsWith('/api/slides?')).length, uploadsBeforeLookup, 'found upload is never retransmitted');
+
+  let releaseUpload;
+  uploadGate = new Promise((resolve) => { releaseUpload = resolve; });
+  const beforeDelayedUpload = requests.length;
+  const delayedUpload = app.uploadSlide(recoveryImage);
+  for (let round = 0; round < 100 && !requests.slice(beforeDelayedUpload).some((item) => item.url.startsWith('/api/slides?')); round++) await new Promise(setImmediate);
+  assert.ok(requests.slice(beforeDelayedUpload).some((item) => item.url.startsWith('/api/slides?')));
+  server.session = recoveryB; await app.poll();
+  $('#slide-status').textContent = 'Class B local notice'; $('#slide-file').value = 'B-selected-image';
+  releaseUpload(); await delayedUpload; uploadGate = null;
+  assert.equal(app.state.session.id, recoveryB.id);
+  assert.equal($('#slide-status').textContent, 'Class B local notice', 'late upload result cannot overwrite another class notice');
+  assert.equal($('#slide-file').value, 'B-selected-image', 'late upload cannot clear another class picker');
+  assert.equal(recoveryB.slides.length, 0, 'upload retains original class server identity');
+
+  server.session = recoveryA; await app.poll();
+  remembered = false; app.state.includeImagesPreference = true; app.renderSlides();
+  let releaseLatePrepare;
+  prepareGate = new Promise((resolve) => { releaseLatePrepare = resolve; });
+  const beforeLatePrepare = requests.length;
+  const latePreparation = trigger(quickButtons[0], 'click');
+  for (let round = 0; round < 100 && !requests.slice(beforeLatePrepare).some((item) => item.url === '/api/study/prepare'); round++) await new Promise(setImmediate);
+  server.session = recoveryB; await app.poll();
+  $('#question-input').value = 'B new draft'; await trigger($('#question-input'), 'input');
+  const sendsBeforeLate = sends().length;
+  releaseLatePrepare(); await latePreparation; prepareGate = null;
+  assert.equal($('#study-dialog').open, false, 'late prepared receipt cannot open its dialog over another class');
+  assert.equal($('#question-input').value, 'B new draft');
+  assert.equal(sends().length, sendsBeforeLate, 'switching away never silently sends a late prepared question');
+  assert.ok(recoveryA.questions.length > 0);
+  assert.equal(recoveryB.questions.length, 0);
+
+  // Source changes and exact historical image identity remain visible.
+  server.session = recoveryA; await app.poll();
+  const originalSlide = clone(recoveryA.slides[0]);
+  const historical = makePrepared({ session_id: recoveryA.id, mode: 'recent30', anchor: 40, question: 'Historical image question', explain: false, include_images: true, slide_ids: [originalSlide.id] });
+  historical.status = 'done'; historical.answer = 'Original answer';
+  app.editSlide(originalSlide.id);
+  const beforeRotatePreview = requests.length;
+  await trigger($('#slide-rotate-right'), 'click'); await trigger($('#slide-rotate-right'), 'click');
+  assert.equal($('#slide-preview').style.transform, 'rotate(180deg)');
+  assert.equal(requests.length, beforeRotatePreview, 'rotation preview stays local until saved');
+  await trigger($('#slide-save-rotation'), 'click');
+  assert.equal(calls('/rotate').at(-1).body.degrees, 180);
+  assert.equal(recoveryA.slides[0].version, (originalSlide.version || 1) + 1);
+  historical.source_status = { token: 'rotated-token', changed: true, unavailable: false, messages: ['图片方向之后已修改'], slides: [{ id: originalSlide.id, version: originalSlide.version || 1, available: true, rotated: true, removed: true }] };
+  await app.poll();
+  const historyMarkup = $('#questions-list').innerHTML;
+  assert.ok(historyMarkup.includes(`version=${originalSlide.version || 1}&sha256=${originalSlide.sha256}`), 'history requests the old exact image version');
+  assert.match(historyMarkup, /历史副本保留/);
+  historical.source_status.slides[0].available = false; historical.source_status.slides[0].availability = 'corrupt'; historical.source_status.unavailable = true;
+  historical.status = 'prepared'; await app.poll(); app.openStudyReview(clone(historical));
+  assert.match($('#study-review').innerHTML, /历史图片缺失或损坏/);
+  assert.equal($('#study-send').disabled, true);
+  const unavailableSendCount = sends().length;
+  $('#study-confirm-original').checked = true;
+  await trigger($('#study-send'), 'click');
+  assert.equal(sends().length, unavailableSendCount, 'unavailable historical images block even forced click');
+  await trigger($('#study-text-only'), 'click');
+  assert.equal(calls('/text-only').at(-1).body.session_id, recoveryA.id);
+
+  const changedQuestion = makePrepared({ session_id: recoveryA.id, mode: 'recent30', anchor: 40, question: 'Edited text snapshot', explain: false, include_images: false });
+  changedQuestion.source_status = { token: 'changed-1', changed: true, unavailable: false, messages: ['课堂原文已修改'], slides: [] };
+  await app.poll(); app.openStudyReview(clone(changedQuestion));
+  assert.equal($('#study-send').disabled, true);
+  $('#study-confirm-original').checked = true; await trigger($('#study-confirm-original'), 'change');
+  assert.equal($('#study-send').disabled, false);
+  changedQuestion.source_status.token = 'changed-2'; await app.poll();
+  assert.equal($('#study-confirm-original').checked, false, 'a further edit invalidates prior source confirmation');
+  $('#study-confirm-original').checked = true; await trigger($('#study-send'), 'click');
+  assert.equal(sends().at(-1).body.source_token, 'changed-2');
+  assert.equal(sends().at(-1).body.confirm_original, true);
+
+  const unknownQuestion = makePrepared({ session_id: recoveryA.id, mode: 'recent30', anchor: 40, question: 'Unknown provider result', explain: false, include_images: false });
+  unknownQuestion.status = 'error'; unknownQuestion.result_unknown = true;
+  const retriesBeforeUnknown = calls('/retry').length;
+  await app.retryStudy(clone(unknownQuestion));
+  assert.equal(calls('/retry').length, retriesBeforeUnknown, 'unknown result cannot clone/retry before billing confirmation');
+  assert.equal($('#study-duplicate-label').hidden, false);
+  await trigger($('#study-send'), 'click');
+  assert.equal(calls('/retry').length, retriesBeforeUnknown);
+  $('#study-confirm-duplicate').checked = true; await trigger($('#study-send'), 'click');
+  assert.equal(calls('/retry').at(-1).body.confirm_duplicate, true);
+  assert.equal(app.state.studyReview.question.status, 'prepared');
+  await trigger($('#study-send'), 'click');
+  assert.equal(sends().at(-1).body.confirm_duplicate, true);
+
+  app.editSlide(originalSlide.id); await trigger($('#slide-remove'), 'click');
+  assert.equal(recoveryA.slides[0].removed, true);
+  assert.ok(!$('#slides-gallery').innerHTML.includes(`data-slide-edit="${originalSlide.id}"`), 'removed image is excluded from new choices');
+
+  // Plain questions have the same idempotent recovery, including after a class
+  // switch (cache receipt is loaded again, but no paid operation runs itself).
+  app.state.includeImagesPreference = false; app.renderSlides();
+  $('#question-input').value = 'Legacy dropped response'; await trigger($('#question-input'), 'input');
+  legacyLostResponse = true;
+  await trigger($('#question-form'), 'submit');
+  assert.ok(app.state.legacyRequests.has(recoveryA.id));
+  assert.match($('#legacy-request-status').textContent, /请求超时、无法确定服务商是否已处理/);
+  const legacyCount = calls('/api/ask').length;
+  server.session = recoveryB; await app.poll();
+  assert.equal($('#legacy-request-recovery').hidden, true);
+  server.session = recoveryA; app.state.legacyRequests.clear(); await app.poll();
+  assert.equal($('#legacy-request-recovery').hidden, false, 'pending plain request restored from cache');
+  assert.equal(calls('/api/ask').length, legacyCount, 'class restore does not call a model');
+  $('#question-input').value = 'A new draft to keep'; await trigger($('#question-input'), 'input');
+  legacyLostResponse = false; await trigger($('#legacy-request-check'), 'click');
+  assert.equal(calls('/api/ask').length, legacyCount, 'existing task receipt avoids a second paid ask');
+  assert.equal($('#question-input').value, 'A new draft to keep');
+  assert.equal(app.state.legacyRequests.has(recoveryA.id), false);
+
+  app.state.includeImagesPreference = true; app.renderSlides(); remembered = true;
+  $('#question-input').value = 'Study dropped send response'; await trigger($('#question-input'), 'input');
+  studySendLostResponse = true;
+  await trigger($('#question-form'), 'submit');
+  const durableStudyRequest = await context.window.studyCache.getRequest(recoveryA.id);
+  assert.ok(durableStudyRequest?.kind.startsWith('study'), 'study sends retain a durable operation when provider enqueue reply is lost');
+  const studySendsBeforeRestore = sends().length;
+  server.session = recoveryB; await app.poll();
+  server.session = recoveryA; app.state.legacyRequests.clear(); await app.poll();
+  studySendLostResponse = false;
+  await trigger($('#question-form'), 'submit');
+  assert.equal(sends().length, studySendsBeforeRestore, 'restored draft cannot bypass an unresolved original study send');
+  await trigger($('#legacy-request-check'), 'click');
+  assert.equal(sends().length, studySendsBeforeRestore, 'recovery looks up existing study task without another model submission');
+
+  recoveryA.groups = [{ id: 'RG1', start: 0, end: 40, segment_ids: ['RS1'], text: 'Group source', status: 'error', error: 'Synthetic failure' }];
+  await app.poll();
+  const retryGroupButton = button({ retryGroup: 'RG1' });
+  legacyRetryLostResponse = true;
+  await trigger(document, 'click', { target: retryGroupButton });
+  const firstGroupRetry = calls('/api/groups/RG1/retry').at(-1);
+  assert.ok(firstGroupRetry?.body.request_id);
+  const retryPostCount = calls('/api/groups/RG1/retry').length;
+  legacyRetryLostResponse = false;
+  await trigger(document, 'click', { target: retryGroupButton });
+  assert.equal(calls('/api/groups/RG1/retry').length, retryPostCount, 'lost retry response resolves through its original receipt');
+  await trigger(document, 'click', { target: retryGroupButton });
+  assert.equal(calls('/api/groups/RG1/retry').length, retryPostCount + 1, 'a subsequent independent retry can submit after the earlier operation was acknowledged');
+  assert.notEqual(calls('/api/groups/RG1/retry').at(-1).body.request_id, firstGroupRetry.body.request_id, 'independent retry has a new key');
+
+  const cache = context.window.studyCache;
+  for (const record of await cache.listUploads()) await cache.deleteUpload(record.id);
+  for (let index = 0; index < 10; index++) await cache.putUpload({ id: `quota-${index}`, session_id: recoveryA.id, start: index, title: `Quota ${index}`, created_at: '2026-10-28', mime_type: 'image/png', blob: recoveryImage });
+  app.state.cachedSlides = await cache.listUploads();
+  const postsBeforeFull = requests.filter((item) => item.url.startsWith('/api/slides?')).length;
+  await app.uploadSlide(recoveryImage);
+  assert.equal((await cache.listUploads()).length, 10, 'capacity does not evict old images');
+  assert.equal(app.state.transientSlides.size, 1);
+  assert.match($('#pending-slides-list').innerHTML, /仅当前页保留，未进入本机暂存/);
+  assert.equal(requests.filter((item) => item.url.startsWith('/api/slides?')).length, postsBeforeFull, 'over-capacity image is not silently uploaded');
+  const transientId = [...app.state.transientSlides.keys()][0];
+  await app.uploadSlide(new Blob(['different'], { type: 'image/png' }));
+  assert.deepEqual([...app.state.transientSlides.keys()], [transientId], 'a second overflow image cannot overwrite the first');
+  await trigger($('#clear-pending-slides'), 'click');
+  assert.equal((await cache.listUploads(recoveryA.id)).length, 0);
+  assert.equal(app.state.transientSlides.size, 0);
+
+  // A cross-tab switch during a settings save cannot redirect a manual source
+  // submission or erase the new classroom's input.
+  $('#manual-text').value = 'A manual source';
+  app.state.settingsDirty = true; app.state.saveGeneration++;
+  let releaseManualSettings;
+  settingsGate = new Promise((resolve) => { releaseManualSettings = resolve; });
+  const manualWritesBefore = calls('/api/text').length;
+  const manualSubmission = trigger($('#text-form'), 'submit');
+  for (let round = 0; round < 20; round++) await Promise.resolve();
+  server.session = recoveryB; await app.poll();
+  $('#manual-text').value = 'B source draft';
+  releaseManualSettings(); await manualSubmission; settingsGate = null;
+  assert.equal(calls('/api/text').length, manualWritesBefore, 'late manual submission is not redirected to the new class');
+  assert.equal($('#manual-text').value, 'B source draft');
+
   assert.equal(microphoneCalls, 0);
+  testCompleted = true;
   console.log('study-ui passed: consent, frozen snapshots, recovery, image selection, input preservation, busy switching; synthetic DOM/API only');
-})().catch((error) => { console.error(error); process.exitCode = 1; });
+})().catch((error) => { testCompleted = true; console.error(error); process.exitCode = 1; });

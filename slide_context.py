@@ -11,8 +11,11 @@ import io
 import math
 import os
 import re
+import struct
+import threading
 import uuid
 import warnings as python_warnings
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
@@ -23,10 +26,17 @@ MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_PIXELS = 24_000_000
 MAX_SLIDES = 4
 _SLIDE_PATH = re.compile(r"slides/[0-9a-f]{32}\.(?:png|jpg)")
+_VERIFIED_ASSETS = OrderedDict()
+_VERIFY_LOCK = threading.Lock()
+_VERIFY_CACHE_SIZE = 128
 
 
 class SlideContextError(ValueError):
     """An application-authored message safe to show in the local interface."""
+
+    def __init__(self, message, *, code="invalid"):
+        super().__init__(message)
+        self.code = code
 
 
 def _time(value, label):
@@ -62,9 +72,74 @@ def _slide_directory(data, session_id):
     return slide_dir
 
 
+def _byte_size(size):
+    return f"{size / (1024 * 1024):.2f} MiB（{size} 字节）"
+
+
+def image_size_message(size, *, width=None, height=None, stage="文件"):
+    """A bounded upload handler may use this without decoding an oversized body."""
+    dimensions = f"，尺寸 {width} × {height}（{width * height} 像素）" if width is not None and height is not None else "，尺寸暂不可读取"
+    return f"图片{stage}实际 {_byte_size(size)}{dimensions}，超过 10 MiB 限制；请先缩小图片，不会自动压缩。"
+
+
+def image_dimensions(content):
+    """Read supported image headers for diagnostics, without allocating pixels.
+
+    Full format verification and decoding are still required for acceptance.
+    A bounded HTTP handler may also pass the received prefix here.
+    """
+    if content[:8] == b'\x89PNG\r\n\x1a\n' and len(content) >= 24 and content[12:16] == b'IHDR':
+        return struct.unpack('>II', content[16:24])
+    if content[:2] == b'\xff\xd8':
+        position = 2
+        while position + 4 <= len(content):
+            if content[position] != 255:
+                break
+            while position < len(content) and content[position] == 255:
+                position += 1
+            if position >= len(content):
+                break
+            marker = content[position]
+            position += 1
+            if marker in (0xD8, 0xD9, 0xDA):
+                break
+            if marker == 1 or 0xD0 <= marker <= 0xD7:
+                continue
+            if position + 2 > len(content):
+                break
+            length = int.from_bytes(content[position:position + 2], 'big')
+            if length < 2 or position + length > len(content):
+                break
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF) and length >= 7:
+                height, width = struct.unpack('>HH', content[position + 3:position + 7])
+                return width, height
+            position += length
+    if content[:4] == b'RIFF' and content[8:12] == b'WEBP':
+        position = 12
+        while position + 8 <= len(content):
+            kind = content[position:position + 4]
+            length = int.from_bytes(content[position + 4:position + 8], 'little')
+            body = content[position + 8:position + 8 + min(length, 10)]
+            if kind == b'VP8X' and len(body) >= 10:
+                return int.from_bytes(body[4:7], 'little') + 1, int.from_bytes(body[7:10], 'little') + 1
+            if kind == b'VP8 ' and len(body) >= 10 and body[3:6] == b'\x9d\x01\x2a':
+                return int.from_bytes(body[6:8], 'little') & 0x3FFF, int.from_bytes(body[8:10], 'little') & 0x3FFF
+            if kind == b'VP8L' and len(body) >= 5 and body[0] == 0x2F:
+                packed = int.from_bytes(body[1:5], 'little')
+                return (packed & 0x3FFF) + 1, ((packed >> 14) & 0x3FFF) + 1
+            position += 8 + length + length % 2
+    return None, None
+
+
 def _image_bytes(content):
-    if not isinstance(content, bytes) or not content or len(content) > MAX_IMAGE_BYTES:
+    if not isinstance(content, bytes) or not content:
         raise SlideContextError("请选择不超过 10 MiB 的 PNG、JPEG 或 WebP 图片。")
+    width, height = image_dimensions(content)
+    if len(content) > MAX_IMAGE_BYTES:
+        raise SlideContextError(image_size_message(len(content), width=width, height=height), code="size")
+    if width is not None and height is not None and width * height > MAX_IMAGE_PIXELS:
+        raise SlideContextError(f"图片实际 {width} × {height}（{width * height} 像素），"
+                                f"文件 {_byte_size(len(content))}；不能超过 2400 万像素，不会自动缩小。", code="size")
     try:
         with python_warnings.catch_warnings():
             python_warnings.simplefilter("error", Image.DecompressionBombWarning)
@@ -73,7 +148,8 @@ def _image_bytes(content):
                 if original_format not in ("PNG", "JPEG", "WEBP"):
                     raise SlideContextError("只支持实际格式为 PNG、JPEG 或 WebP 的图片。")
                 if probe.width * probe.height > MAX_IMAGE_PIXELS:
-                    raise SlideContextError("图片不能超过 2400 万像素。")
+                    raise SlideContextError(f"图片实际 {probe.width} × {probe.height}（{probe.width * probe.height} 像素），"
+                                            f"文件 {_byte_size(len(content))}；不能超过 2400 万像素，不会自动缩小。", code="size")
                 if getattr(probe, "n_frames", 1) != 1:
                     raise SlideContextError("请上传单帧图片，不支持动画或多帧图片。")
                 probe.verify()
@@ -94,7 +170,8 @@ def _image_bytes(content):
                     extension, mime_type = "png", "image/png"
                 encoded = output.getvalue()
                 if len(encoded) > MAX_IMAGE_BYTES:
-                    raise SlideContextError("图片重新编码后超过 10 MiB，请先缩小图片再上传；未降低清晰度或保存文件。")
+                    raise SlideContextError(f"图片重新编码后超过 10 MiB：实际 {_byte_size(len(encoded))}，"
+                                            f"尺寸 {clean.width} × {clean.height}；请先缩小图片再上传，未降低清晰度或保存文件。", code="size")
                 return encoded, extension, mime_type, clean.width, clean.height
     except SlideContextError:
         raise
@@ -103,22 +180,9 @@ def _image_bytes(content):
         raise SlideContextError("无法完整解码这张图片，请重新导出为 PNG、JPEG 或 WebP。") from None
 
 
-def save_slide(data: Path, session: dict, content: bytes, *, start: float, title: str = "") -> dict:
-    start = _time(start, "图片开始时间")
-    if not isinstance(title, str) or len(title) > 160:
-        raise SlideContextError("图片标题最多 160 个字符。")
-    slides = session.get("slides", [])
-    if not isinstance(slides, list):
-        raise SlideContextError("课堂图片记录格式无效。")
-    open_slides = [slide for slide in slides if slide.get("end") is None]
-    for slide in open_slides:
-        previous_start = _time(slide.get("start"), "已有图片开始时间")
-        if previous_start > start:
-            raise SlideContextError("新图片时间早于当前图片，请先手动调整图片时间区间。")
-    encoded, extension, mime_type, width, height = _image_bytes(content)
-    slide_dir = _slide_directory(data, session.get("id"))
-    sequence = max((int(match.group(1)) for slide in slides
-                    if (match := re.fullmatch(r"P(\d{4,})", str(slide.get("id", ""))))), default=0) + 1
+def _write_image_asset(data, session_id, encoded, extension):
+    """Publish an immutable asset; do not mutate session state before success."""
+    slide_dir = _slide_directory(data, session_id)
     filename = f"{uuid.uuid4().hex}.{extension}"
     target = slide_dir / filename
     created = False
@@ -135,13 +199,45 @@ def save_slide(data: Path, session: dict, content: bytes, *, start: float, title
                 target.unlink()
             except OSError:
                 pass
-        raise SlideContextError("课件图片未能保存，请检查本机存储后重试。") from None
-    slide = {"id": f"P{sequence:04d}", "title": title.strip(), "start": start, "end": None,
-             "path": f"slides/{filename}", "mime_type": mime_type,
+        raise SlideContextError("课件图片未能保存，请检查本机存储后重试。", code="storage") from None
+    return f"slides/{filename}"
+
+
+def save_slide(data: Path, session: dict, content: bytes, *, start: float, title: str = "", allow_backdated=False) -> dict:
+    start = _time(start, "图片开始时间")
+    if not isinstance(title, str) or len(title) > 160:
+        raise SlideContextError("图片标题最多 160 个字符。")
+    slides = session.get("slides", [])
+    if not isinstance(slides, list):
+        raise SlideContextError("课堂图片记录格式无效。")
+    open_slides = [slide for slide in slides if slide.get("end") is None and not slide.get("removed")]
+    end = None
+    if allow_backdated:
+        active = [slide for slide in slides if not slide.get('removed')]
+        end = min((_time(slide.get('start'), '已有图片开始时间') for slide in active if slide['start'] > start), default=None)
+        open_slides = [slide for slide in active if slide['start'] < start and
+                       (slide.get('end') is None or slide['end'] > start and
+                        slide.get('auto_closed_end') == slide['end'])]
+    else:
+        for slide in open_slides:
+            previous_start = _time(slide.get("start"), "已有图片开始时间")
+            if previous_start > start:
+                raise SlideContextError("新图片时间早于当前图片，请先手动调整图片时间区间。")
+    encoded, extension, mime_type, width, height = _image_bytes(content)
+    sequence = max((int(match.group(1)) for slide in slides
+                    if (match := re.fullmatch(r"P(\d{4,})", str(slide.get("id", ""))))), default=0) + 1
+    relative = _write_image_asset(data, session.get("id"), encoded, extension)
+    slide = {"id": f"P{sequence:04d}", "title": title.strip(), "start": start, "end": end,
+             "path": relative, "mime_type": mime_type, "version": 1, "interval_version": 0,
              "sha256": hashlib.sha256(encoded).hexdigest(), "width": width, "height": height,
              "created_at": datetime.now().astimezone().isoformat(timespec="seconds")}
+    if end is not None:
+        slide.update(auto_closed_end=end, auto_closed_interval_version=0, auto_end_history=[None])
     for previous in open_slides:
+        previous.setdefault('auto_end_history', []).append(previous.get('end'))
         previous["end"] = start
+        previous["auto_closed_end"] = start
+        previous["auto_closed_interval_version"] = previous.get("interval_version", 0)
     session.setdefault("slides", []).append(slide)
     return copy.deepcopy(slide)
 
@@ -151,11 +247,18 @@ def update_slide_interval(session: dict, slide_id: str, start: float, end: float
     slide = next((item for item in session.get("slides", []) if item.get("id") == slide_id), None)
     if slide is None:
         raise SlideContextError("找不到本课堂的这张图片。")
+    if slide.get("removed"):
+        raise SlideContextError("这张课件已从当前选择移除，历史副本仍保留。")
+    if slide.get("start") != start or slide.get("end") != end:
+        slide["interval_version"] = slide.get("interval_version", 0) + 1
+        slide.pop("auto_closed_end", None)
+        slide.pop("auto_closed_interval_version", None)
+        slide.pop("auto_end_history", None)
     slide.update(start=start, end=end)
     return copy.deepcopy(slide)
 
 
-def resolve_slide_path(data: Path, session_id: str, slide: dict) -> Path:
+def resolve_slide_path(data: Path, session_id: str, slide: dict, *, force=True) -> Path:
     relative = slide.get("path")
     expected_hash = slide.get("sha256")
     if (not isinstance(relative, str) or not _SLIDE_PATH.fullmatch(relative)
@@ -167,14 +270,30 @@ def resolve_slide_path(data: Path, session_id: str, slide: dict) -> Path:
     if path.is_symlink() or resolved.parent != slide_dir:
         raise SlideContextError("课件图片路径必须位于本课堂目录内。")
     try:
+        stat = resolved.stat()
+        stamp = (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+        key = (str(resolved), expected_hash, *stamp)
+        if not force:
+            with _VERIFY_LOCK:
+                if key in _VERIFIED_ASSETS:
+                    _VERIFIED_ASSETS.move_to_end(key)
+                    return resolved
         digest = hashlib.sha256()
         with resolved.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
+        after = resolved.stat()
     except OSError:
-        raise SlideContextError("课件图片文件不可用，请重新上传。") from None
+        raise SlideContextError("课件图片文件不可用，历史副本目前不可查看；不会改用新图片。", code="missing") from None
     if digest.hexdigest() != expected_hash:
-        raise SlideContextError("课件图片校验失败，文件可能已变化；旧引用不会改用这张图片。")
+        raise SlideContextError("课件图片校验失败，文件可能已变化；历史副本不可查看，旧引用不会改用这张图片。", code="corrupt")
+    if (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_ino) != stamp:
+        raise SlideContextError("课件图片在校验时发生变化，暂不可查看；请重试。", code="corrupt")
+    with _VERIFY_LOCK:
+        _VERIFIED_ASSETS[key] = True
+        _VERIFIED_ASSETS.move_to_end(key)
+        while len(_VERIFIED_ASSETS) > _VERIFY_CACHE_SIZE:
+            _VERIFIED_ASSETS.popitem(last=False)
     return resolved
 
 
@@ -270,7 +389,7 @@ def snapshot_context(session: dict, *, mode, anchor, group_id=None, slide_ids=No
     if any(s.get("time_estimated") for s in frozen_segments):
         notices.append("所选原文包含手动补充，其时间为估算值，不能视为准确的录音定位。")
 
-    available = session.get("slides", [])
+    available = [slide for slide in session.get("slides", []) if not slide.get("removed")]
     by_id = {slide["id"]: slide for slide in available}
     if slide_ids is not None:
         if (not isinstance(slide_ids, (list, tuple)) or any(not isinstance(sid, str) for sid in slide_ids)
@@ -294,7 +413,8 @@ def snapshot_context(session: dict, *, mode, anchor, group_id=None, slide_ids=No
         _interval(slide.get("start"), slide.get("end"), open_end=True)
     if slide_ids is not None and any(not _overlaps(slide["start"], slide.get("end"), range_start, range_end) for slide in chosen_slides):
         notices.append("手选图片包含所选时间之外的课件；图片内容不等于老师在该时间已经讲过。")
-    frozen_slides = copy.deepcopy(chosen_slides)
+    frozen_slides = [copy.deepcopy({key: value for key, value in slide.items() if key != 'versions'})
+                     for slide in chosen_slides]
     lines = [f"固定选取范围：{_clock(range_start)}–{_clock(range_end)}。",
              "课堂原文证据（机器转写可能有误；手动补充时间为估算）："]
     for segment in frozen_segments:

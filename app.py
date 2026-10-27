@@ -32,7 +32,8 @@ from classroom_features import ClassroomFeatures, wav_duration
 from course_catalog import glossary_terms, validate_glossary
 from session_order import creation_order, newest_first
 from input_limits import INPUT_LIMITS, require_content, validation_message
-from study_workflow import StudyWorkflow
+from study_workflow import StudyWorkflow, UNKNOWN_TIMEOUT, UNKNOWN_RESULT
+from slide_context import image_dimensions, image_size_message
 
 ROOT = Path(__file__).resolve().parent
 
@@ -134,9 +135,18 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                 # provider even when this process never received its result.
                 usage["unknown"] += max(0, usage["requests"] - usage["completed"] - usage["failed"] - usage["unknown"])
                 # Interrupted AI work is not silently represented as completed.
-                for item in s["groups"] + s["questions"] + s["revisions"]:
+                for item, is_ai in ([(record, True) for record in s['groups'] + s['questions']]
+                                    + [(record, False) for record in s['revisions']]):
+                    legacy_unknown = is_ai and (item.get('status') == 'running' or
+                                      item.get('status') in ('paused', 'error') and item.get('error_kind') in ('timeout', 'network'))
+                    if legacy_unknown and not item.get('dispatch_completed_at'):
+                        item.update(result_unknown=True, dispatch_state='unknown',
+                                    error=UNKNOWN_TIMEOUT if item.get('error_kind') == 'timeout' else UNKNOWN_RESULT)
                     if item.get("status") in ("pending", "running"):
-                        item.update(status="error", error="上次运行中断，可重试这一项。")
+                        if item.get('result_unknown') or item.get('dispatch_started_at') and not item.get('dispatch_completed_at'):
+                            item.update(status='error', result_unknown=True, dispatch_state='unknown', error=UNKNOWN_RESULT)
+                        else:
+                            item.update(status="error", error="上次运行中断，可重试这一项。")
                     if item.get("stream_status") == "streaming":
                         item["stream_status"] = "interrupted"
                 self.sessions[s["id"]] = s
@@ -304,7 +314,7 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
 
     def settings(self, values):
         with self.lock:
-            s = self.get()
+            s = self.get(values.get('session_id'))
             if "title" in values:
                 s["title"] = values["title"][:160] or "新的课堂"
             for key in ("terms", "auto_analyze"):
@@ -513,9 +523,12 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                 f"\n此前 AI 笔记（可能有误，原文优先）：\n{summaries[-8000:]}\n课堂转写：\n{raw[-16000:]}"
                 + (f"\n用户明确选中的旧段落，请优先回答这一段及其邻近语境：\n{focus_raw[-16000:]}" if focused else ""))
 
-    def ask(self, question, group_id=None, sid=None):
+    def ask(self, question, group_id=None, sid=None, *, request_id=None):
         with self.lock:
             s = self.get(sid)
+            fingerprint = self.request_fingerprint({'question': question, 'group_id': group_id})
+            if self.existing_request(s, request_id, 'ask', fingerprint):
+                return self.lookup_request(request_id, s['id'])['job']
             if s["demo"]:
                 raise HTTPException(400, "演示不调用 AI。请新建课程，或用文本录入测试真实问答。")
             item = {"id": f"Q{len(s['questions']) + 1:04d}", "question": question, "answer": "", "group_id": group_id,
@@ -523,12 +536,24 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                     "history_snapshot": [{"role": role, "content": value} for q in s["questions"][-5:] if q.get("status") == "done" and not q.get("stale") for role, value in (("user", q["question"]), ("assistant", q["answer"]))]}
             s["questions"].append(item)
             job = self._enqueue_ai(s, item, "question")
-            self.save(s)
+            if request_id:
+                item['request_id'] = request_id
+            self.remember_request(s, request_id, 'ask', fingerprint, item['id'], job=copy.deepcopy(job))
+            try:
+                self.save(s)
+            except OSError:
+                s['questions'].pop()
+                self.jobs[job['id']]['status'] = 'cancelled'
+                s.get('request_receipts', {}).pop(request_id, None)
+                raise HTTPException(507, '本机保存失败，问题尚未发送；原输入保留，可手动重试。') from None
             return copy.deepcopy(job)
 
-    def retry(self, kind, item_id, sid=None):
+    def retry(self, kind, item_id, sid=None, *, confirm_duplicate=False, request_id=None):
         with self.lock:
             s = self.get(sid)
+            fingerprint = self.request_fingerprint({'kind': kind, 'item_id': item_id})
+            if self.existing_request(s, request_id, 'legacy-retry', fingerprint):
+                return self.lookup_request(request_id, s['id'])['job']
             if s["demo"]:
                 raise HTTPException(400, "演示课程不调用 AI。")
             collection = s["groups"] if kind == "analysis" else s["questions"]
@@ -539,8 +564,24 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                 raise HTTPException(409, "图文与即时解释须先检查原快照及发送目的地，请使用该条记录的确认重试入口。")
             if item["status"] in ("pending", "running"):
                 raise HTTPException(409, "这一项正在处理。")
+            if item.get('result_unknown') and not confirm_duplicate:
+                raise HTTPException(409, '之前的请求可能已处理或计费；请确认可能重复计费后再重试。')
+            previous = copy.deepcopy(item)
+            if item.get('result_unknown'):
+                item.setdefault('attempts', []).append({'status': 'result_unknown', 'at': stamp()})
+            for key in ('dispatch_started_at', 'dispatch_completed_at', 'dispatch_state', 'result_unknown'):
+                item.pop(key, None)
             result = self._enqueue_ai(s, item, kind)
-            self.save(s)
+            self.remember_request(s, request_id, 'legacy-retry', fingerprint, item_id,
+                                  item_kind=kind, job=copy.deepcopy(result))
+            try:
+                self.save(s)
+            except OSError:
+                self.jobs[result['id']]['status'] = 'cancelled'
+                item.clear()
+                item.update(previous)
+                s.get('request_receipts', {}).pop(request_id, None)
+                raise HTTPException(507, '本机保存失败，重试尚未发送；请保留原记录。') from None
             return copy.deepcopy(result)
 
     def _pause_ai_storage(self):
@@ -563,16 +604,14 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
             with self.lock:
                 s = self.get(sid)
                 items = self.courses if kind == "glossary" else s["groups"] if kind == "analysis" else s["questions"]
-                item = next(x for x in items if x["id"] == item_id)
-                if item.get("job_id") != jid or item.get("status") != "pending" or self.ai["paused"]:
+                item = next((x for x in items if x["id"] == item_id), None)
+                if item is None or item.get("job_id") != jid or item.get("status") != "pending" or self.ai["paused"]:
                     self.ai_queue.task_done()
                     continue
-                if item.get("study") and (item.get("destination", {}).get("token") != self.study_route or not item.get("confirmed_at")):
-                    item.update(status="prepared", error="接入已变化，请重新确认目的地后发送。")
-                    self.jobs[jid]["status"] = "superseded"
-                    item.pop("job_id", None)
+                blocked_reason = self.study_dispatch_block_reason(s, item) if item.get('study') else None
+                if blocked_reason:
                     try:
-                        self.save(s)
+                        self.defer_study_dispatch(s, item, jid, blocked_reason)
                     except OSError:
                         self._pause_ai_storage()
                     self.ai_queue.task_done()
@@ -619,6 +658,8 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
             success = False
             api_attempt = False
             usage_recorded = False
+            dispatched = False
+            provider_returned = False
             metadata = {"provider": provider, "model": model, "usage": None}
 
             def stream_delta(delta):
@@ -636,6 +677,8 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                         self.save_courses()
                 # Resolve immutable assets before any provider submission or usage count.
                 images = self.study_images(s, item) if item.get("study") else []
+                if item.get('study') and not hasattr(request_bridge, 'ask_visual') and provider != 'api':
+                    raise CodexBridgeError('当前接入尚未提供图文解释能力，请检查版本。')
                 if provider == "api":
                     # Snapshot destination and credential before releasing the
                     # queue lock; changing settings cannot redirect this call.
@@ -643,10 +686,35 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                         raise CodexBridgeError("请在 AI 设置中填写 API 地址、模型和密钥。", kind="auth")
                     request_bridge = self.connection.api_factory({**api_config, "timeout_seconds": self.connection.timeout}, api_key,
                                                                  on_delta=stream_delta if kind != "glossary" else None)
-                    with self.lock:
-                        s["ai_usage"]["requests"] += 1
-                        api_attempt = True
+                with self.lock:
+                    # The final gate uses only the frozen receipt's sources.
+                    # New teaching does not revoke consent; source edits do.
+                    if item.get('job_id') != jid:
+                        continue
+                    blocked_reason = self.study_dispatch_block_reason(s, item) if item.get('study') else None
+                    if blocked_reason:
+                        self.defer_study_dispatch(s, item, jid, blocked_reason)
+                        continue
+                    previous_dispatch = {key: item.get(key) for key in ('dispatch_started_at', 'dispatch_completed_at', 'dispatch_state', 'result_unknown')}
+                    item.update(dispatch_started_at=stamp(), dispatch_state='started', result_unknown=False)
+                    item.pop('dispatch_completed_at', None)
+                    if provider == 'api':
+                        s['ai_usage']['requests'] += 1
+                    try:
                         self.save(s)
+                        if kind == 'glossary':
+                            self.save_courses()
+                    except OSError:
+                        for key, value in previous_dispatch.items():
+                            if value is None:
+                                item.pop(key, None)
+                            else:
+                                item[key] = value
+                        if provider == 'api':
+                            s['ai_usage']['requests'] -= 1
+                        raise
+                    dispatched = True
+                    api_attempt = provider == 'api'
                 if kind == "analysis":
                     result = request_bridge.analyze(context, raw)
                 elif kind == "glossary":
@@ -656,11 +724,13 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                         raise CodexBridgeError("当前接入尚未提供图文解释能力，请检查版本。")
                     result = request_bridge.ask_visual(context, item["question"], images,
                                 explain=item.get("explain", False), cancel_event=cancel_event)
+                    provider_returned = True
                     # Ordinary lecture text may itself mention an S/P-shaped
                     # identifier. Only actual receipt sources authorize citations.
                     _validate_references(result, context, set(item['evidence']['source_ids']))
                 else:
                     result = request_bridge.ask(context, item["question"], history)
+                provider_returned = True
                 if provider == "api":
                     metadata = request_bridge.metadata()
                 success = True
@@ -672,7 +742,8 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                         continue
                     if item.get("study"):
                         self.record_study_vision(request_token, image_count, True)
-                    item.update(status="done", elapsed=round(time.monotonic()-began, 2))
+                    item.update(status="done", elapsed=round(time.monotonic()-began, 2),
+                                dispatch_completed_at=stamp(), dispatch_state='complete', result_unknown=False)
                     item.update(ai_provider=provider, ai_model=metadata.get("model"), usage=metadata.get("usage"),
                                 stream_status="complete", streaming_text="")
                     if kind == "glossary":
@@ -693,6 +764,15 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                              else str(exc)[:400] if isinstance(exc, CodexBridgeError)
                              else "AI 暂时无法完成回答，请检查设置后重试。")
                     error_kind = 'storage' if isinstance(exc, OSError) else getattr(exc, "kind", "other")
+                    unknown = dispatched and not provider_returned and error_kind not in ('auth', 'quota', 'vision_unsupported')
+                    if unknown:
+                        error = UNKNOWN_TIMEOUT if error_kind == 'timeout' else UNKNOWN_RESULT
+                    elif error_kind == 'timeout':
+                        error = UNKNOWN_TIMEOUT
+                    item.update(result_unknown=unknown,
+                                dispatch_state='unknown' if unknown else 'failed' if dispatched else 'not_sent')
+                    if dispatched and not unknown:
+                        item['dispatch_completed_at'] = stamp()
                     if item.get("study") and error_kind == "vision_unsupported":
                         self.record_study_vision(request_token, image_count, False)
                     paused = error_kind in ("network", "quota", "auth", "timeout", "storage")
@@ -793,6 +873,7 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
 
 
 class Settings(BaseModel):
+    session_id: str | None = None
     title: str | None = Field(default=None, max_length=160)
     terms: str | None = Field(default=None, max_length=2000)
     auto_analyze: bool | None = None
@@ -813,12 +894,18 @@ class AskInput(BaseModel):
     question: str = Field(min_length=1, max_length=INPUT_LIMITS["question"])
     group_id: str | None = None
     session_id: str | None = None
+    request_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9_-]{8,128}$')
 
     _nonblank = field_validator("question")(require_content)
 
 
 class SessionInput(BaseModel):
     session_id: str | None = None
+
+
+class RequestInput(SessionInput):
+    request_id: str | None = Field(default=None, pattern=r'^[A-Za-z0-9_-]{8,128}$')
+    confirm_duplicate: bool = False
 
 
 class ModeInput(BaseModel):
@@ -857,6 +944,11 @@ class SlideIntervalInput(SessionInput):
     title: str | None = Field(default=None, max_length=160)
 
 
+class SlideRotateInput(RequestInput):
+    degrees: Literal[0, 90, 180, 270] | None = None
+    direction: Literal['left', 'right'] = 'right'
+
+
 class SeenSegment(BaseModel):
     id: str = Field(max_length=80)
     version: int = Field(default=0, ge=0, strict=True)
@@ -868,9 +960,11 @@ class SeenSlide(BaseModel):
     start: float = Field(ge=0, allow_inf_nan=False)
     end: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     title: str = Field(default='', max_length=160)
+    version: int | None = Field(default=None, ge=1, strict=True)
+    interval_version: int = Field(default=0, ge=0, strict=True)
 
 
-class StudyInput(SessionInput):
+class StudyInput(RequestInput):
     mode: Literal['recent30', 'recent120', 'group'] = 'recent120'
     anchor: float = Field(ge=0, allow_inf_nan=False)
     group_id: str | None = Field(default=None, max_length=80)
@@ -887,6 +981,9 @@ class StudySendInput(SessionInput):
     destination_token: str = Field(min_length=1, max_length=128)
     confirm_images: bool = False
     remember: bool = False
+    source_token: str | None = Field(default=None, max_length=128)
+    confirm_original: bool = False
+    confirm_duplicate: bool = False
 
 
 def create_app(config=None, data=None, engine=None, bridge=None):
@@ -924,7 +1021,7 @@ def create_app(config=None, data=None, engine=None, bridge=None):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self'; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; worker-src 'self'; media-src 'self' blob:; object-src 'none'; frame-ancestors 'none'"
         return response
 
     @app.get("/api/state")
@@ -948,40 +1045,72 @@ def create_app(config=None, data=None, engine=None, bridge=None):
         return room.test_ai(body.model_dump(exclude_none=True))
 
     @app.post('/api/slides')
-    async def add_slide(request: Request, session_id: str, start: float, title: str = ''):
+    async def add_slide(request: Request, session_id: str, start: float, title: str = '', request_id: str | None = None):
         chunks = bytearray()
         async for chunk in request.stream():
             if len(chunks) + len(chunk) > 10 * 1024 * 1024:
-                raise HTTPException(413, '每张课件图片最多 10 MiB，请缩小图片后重试。')
+                length = request.headers.get('content-length', '')
+                actual = int(length) if length.isdecimal() and len(length) < 20 else len(chunks) + len(chunk)
+                width, height = image_dimensions(bytes(chunks[:1_048_576]) if chunks else chunk[:1_048_576])
+                detail = image_size_message(actual, width=width, height=height)
+                if not length.isdecimal():
+                    detail += '已接收字节已超限；完整文件大小未知。'
+                raise HTTPException(413, detail)
             chunks.extend(chunk)
         if len(title) > 160:
             raise HTTPException(422, '课件名称最多 160 个字符。')
-        return await run_in_threadpool(room.add_slide, bytes(chunks), start=start, sid=session_id, title=title)
+        return await run_in_threadpool(room.add_slide, bytes(chunks), start=start, sid=session_id, title=title, request_id=request_id)
+
+    @app.get('/api/slides/requests/{request_id}')
+    def slide_request(request_id: str, session_id: str):
+        return room.lookup_slide_request(request_id, session_id)
+
+    @app.post('/api/slides/{pid}/rotate')
+    def rotate_slide_route(pid: str, body: SlideRotateInput):
+        return room.rotate_study_slide(pid, body.model_dump())
+
+    @app.delete('/api/slides/{pid}')
+    def remove_slide_route(pid: str, session_id: str):
+        return room.remove_study_slide(pid, session_id)
 
     @app.patch('/api/slides/{pid}')
     def update_slide(pid: str, body: SlideIntervalInput):
         return room.update_slide(pid, body.model_dump())
 
     @app.get('/api/slides/{pid}')
-    def slide_file(pid: str, session_id: str):
-        path, mime = room.slide_file(pid, session_id)
+    def slide_file(pid: str, session_id: str, version: int | None = None, sha256: str | None = None):
+        path, mime = room.slide_file(pid, session_id, version=version, sha256=sha256)
         return FileResponse(path, media_type=mime)
 
     @app.post('/api/study/prepare')
     def prepare_study(body: StudyInput):
         return room.prepare_study(body.model_dump())
 
+    @app.get('/api/study/requests/{request_id}')
+    def study_request(request_id: str, session_id: str):
+        return room.lookup_study_request(request_id, session_id)
+
+    @app.get('/api/requests/{request_id}')
+    def any_request(request_id: str, session_id: str):
+        return room.lookup_request(request_id, session_id)
+
+    @app.get('/api/study/{qid}')
+    def get_study(qid: str, session_id: str):
+        with room.lock:
+            return room.study_public(room.study_question(room.get(session_id), qid), session_id)
+
     @app.post('/api/study/{qid}/send')
     def send_study(qid: str, body: StudySendInput):
         return room.send_study(qid, body.model_dump())
 
     @app.post('/api/study/{qid}/retry')
-    def retry_study(qid: str, body: SessionInput):
-        return room.clone_study(qid, body.session_id)
+    def retry_study(qid: str, body: RequestInput):
+        return room.clone_study(qid, body.session_id, request_id=body.request_id, confirm_duplicate=body.confirm_duplicate)
 
     @app.post('/api/study/{qid}/text-only')
-    def text_only_study(qid: str, body: SessionInput):
-        return room.clone_study(qid, body.session_id, text_only=True)
+    def text_only_study(qid: str, body: RequestInput):
+        return room.clone_study(qid, body.session_id, text_only=True, request_id=body.request_id,
+                                confirm_duplicate=body.confirm_duplicate)
 
     @app.post("/api/mode")
     def mode(body: ModeInput):
@@ -1076,15 +1205,19 @@ def create_app(config=None, data=None, engine=None, bridge=None):
 
     @app.post("/api/ask")
     def ask(body: AskInput):
-        return room.ask(body.question, body.group_id, body.session_id)
+        return room.ask(body.question, body.group_id, body.session_id, request_id=body.request_id)
 
     @app.post("/api/groups/{gid}/retry")
-    def retry_group(gid: str, body: SessionInput | None = None):
-        return room.retry("analysis", gid, body.session_id if body else None)
+    def retry_group(gid: str, body: RequestInput | None = None):
+        return room.retry("analysis", gid, body.session_id if body else None,
+                          confirm_duplicate=body.confirm_duplicate if body else False,
+                          request_id=body.request_id if body else None)
 
     @app.post("/api/questions/{qid}/retry")
-    def retry_question(qid: str, body: SessionInput | None = None):
-        return room.retry("question", qid, body.session_id if body else None)
+    def retry_question(qid: str, body: RequestInput | None = None):
+        return room.retry("question", qid, body.session_id if body else None,
+                          confirm_duplicate=body.confirm_duplicate if body else False,
+                          request_id=body.request_id if body else None)
 
     @app.post("/api/audio/{seq}/retry")
     def retry_audio(seq: int, body: SessionInput | None = None):

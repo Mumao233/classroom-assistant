@@ -59,6 +59,7 @@ const context = vm.createContext({
     if (deferredSubmit?.path === url) { deferredSubmit.entered(); await deferredSubmit.wait; }
     if ((offline && url === '/api/state') || url === failurePath) return { ok: false, status: 422, json: async () => ({ detail: 'Synthetic request rejected.' }) };
     if (url === '/api/state') return { ok: true, status: 200, json: async () => clone(server) };
+    if (url.startsWith('/api/requests/')) return { ok: true, status: 200, json: async () => ({ found: false }) };
     assert.ok(fields.some((field) => field.endpoint === url), `unexpected mock API request ${url}`);
     return { ok: true, status: 200, json: async () => ({}) };
   },
@@ -70,8 +71,11 @@ const $ = (selector) => document.querySelector(selector);
 const writes = (field) => requests.filter((request) => request.url === field.endpoint);
 async function trigger(element, type) { for (const handler of element.listeners[type] || []) await handler({ preventDefault() {}, target: element, submitter: new Element('BUTTON') }); }
 async function prepare(field, value) {
+  // Each boundary case represents a fresh form; request recovery is covered
+  // separately in study-ui.cjs with persistent request IDs and lost responses.
+  context.test.state.legacyRequests.clear();
   context.test.state.queueLoaded = true;
-  context.test.state.editingSegment = { id: 'S1', sessionId: server.session.id };
+  context.test.state.editingSegment = { id: 'S1', sessionId: server.session.id, epoch: context.test.state.sessionEpoch };
   context.test.state.glossaryCourseId = 'course';
   $('#glossary-dialog').open = true;
   $('#generate-glossary').disabled = false;
@@ -79,6 +83,10 @@ async function prepare(field, value) {
   await trigger($(field.input), 'input');
 }
 const results = [];
+let finished = false;
+process.on('beforeExit', () => {
+  if (!finished) { console.error('Input-limit suite did not finish (unresolved mock request).'); process.exitCode = 1; }
+});
 async function check(name, callback) {
   try { await callback(); results.push({ name, passed: true }); }
   catch (error) { results.push({ name, passed: false, error: String(error.message).slice(0, 400) }); }
@@ -211,4 +219,5 @@ function mixedText(length) { return '中a😀'.repeat(Math.floor(length / 3)) + 
   const failures = results.filter((result) => !result.passed);
   console.log(JSON.stringify({ test: 'Unicode input limits', passed: results.length - failures.length, failed: failures.length, mockRequests: requests.length, realNetwork: false, failures }, null, 2));
   if (failures.length) process.exitCode = 1;
+  finished = true;
 })().catch((error) => { console.error(error); process.exitCode = 1; });

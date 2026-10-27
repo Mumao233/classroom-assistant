@@ -56,9 +56,19 @@ def test_ai_pauses_without_losing_questions_or_stopping_audio(room_factory, kind
     assert len(bridge.calls) == 1
     assert all(q["status"] == "paused" for q in room.get()["questions"])
     room.resume_ai("latest")
+    if kind in ('network', 'timeout'):
+        # A dispatched request with no result cannot be quietly submitted again
+        # by the generic recovery button. Explicit billing consent is required.
+        wait_for(lambda: all(q['status'] == 'done' for q in room.get()['questions'][1:]))
+        unknown = room.get()['questions'][0]
+        assert unknown['result_unknown'] and unknown['status'] == 'error'
+        assert len(bridge.calls) == 3
+        with pytest.raises(HTTPException):
+            room.retry('question', unknown['id'])
+        room.retry('question', unknown['id'], confirm_duplicate=True)
     wait_for(lambda: all(q["status"] == "done" for q in room.get()["questions"]))
     assert len(bridge.calls) == 4
-    assert room.jobs[first["id"]]["status"] == "superseded"
+    assert room.jobs[first["id"]]["status"] == ('error' if kind in ('network', 'timeout') else 'superseded')
 
 
 def test_paused_restart_and_latest_preserve_explicit_questions(room_factory, tmp_path):

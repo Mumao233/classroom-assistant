@@ -246,7 +246,12 @@ def test_failed_ai_item_can_retry_without_duplicate_record(room_factory, kind):
     launch(room, "_ai_loop")
     wait_for(lambda: item["status"] == "error")
     old_job = item["job_id"]
-    new_job = room.retry(kind, item["id"])
+    assert item['result_unknown']
+    with pytest.raises(HTTPException) as confirmation:
+        room.retry(kind, item['id'])
+    assert confirmation.value.status_code == 409
+    assert len(bridge.calls) == 1 and item['job_id'] == old_job
+    new_job = room.retry(kind, item["id"], confirm_duplicate=True)
     assert new_job["id"] != old_job
     wait_for(lambda: item["status"] == "done")
     assert len(items) == 1

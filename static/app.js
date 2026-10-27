@@ -17,6 +17,10 @@
     aiSettings: null, aiSettingsBusy: false, aiResuming: false,
     slideSelection: null, includeImagesPreference: null, slideBusy: false, editingSlide: null,
     studyBusy: false, studyReview: null, studyFailedParams: null, studyDrafts: new Map(),
+    sessionEpoch: 0, draftTexts: new Map(), draftWrites: new Map(), draftRevision: new Map(),
+    cachedSlides: [], transientSlides: new Map(), cacheReady: false, cachePromise: null,
+    requestIds: new Map(), slideURLs: new Map(), slideRecoveryBusy: false,
+    legacyRequests: new Map(), pendingLegacyRetry: null,
   };
 
   const escapeHTML = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]);
@@ -101,7 +105,7 @@
       }
       return options.raw ? response : response.status === 204 ? null : response.json();
     } catch (error) {
-      if (error.name === 'AbortError') throw new Error('本地服务响应超时，可重新打开启动课间。');
+      if (error.name === 'AbortError') { const timeout = new Error('请求超时、无法确定服务商是否已处理'); timeout.resultUnknown = true; throw timeout; }
       if (error instanceof TypeError) throw new Error('无法连接本地服务，请双击启动课间后重试。');
       throw error;
     } finally {
@@ -324,6 +328,215 @@
     finally { state.aiSettingsBusy = false; updateAIFormControls(); }
   }
 
+  const viewScope = (sessionId = state.session?.id) => ({ sessionId, epoch: state.sessionEpoch });
+  const inView = (scope) => Boolean(scope && state.session?.id === scope.sessionId && state.sessionEpoch === scope.epoch);
+  const resultUnknown = (question) => Boolean(question?.result_unknown || question?.duplicate_billing_risk || question?.repeat_billing_required || question?.status === 'result_unknown');
+  function newRequestId() { return globalThis.crypto?.randomUUID?.() || `ui-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`; }
+  function operationId(sessionId, action, id) {
+    const key = `classroom-operation:${sessionId}:${action}:${id}`;
+    if (state.requestIds.has(key)) return state.requestIds.get(key);
+    let value;
+    try { value = localStorage.getItem(key); } catch (_) {}
+    value ||= newRequestId(); state.requestIds.set(key, value);
+    try { localStorage.setItem(key, value); } catch (_) {}
+    return value;
+  }
+  function finishOperation(sessionId, action, id) {
+    const key = `classroom-operation:${sessionId}:${action}:${id}`;
+    state.requestIds.delete(key); try { localStorage.removeItem?.(key); } catch (_) {}
+  }
+  function cacheNotice(status) {
+    const current = status || window.studyCache?.status?.();
+    if (!current) return;
+    $('#study-cache-status').textContent = current.persistent ? '图片暂存和问题草稿保存在此浏览器本机；恢复后请手动重试。' : current.message || '图片和草稿仅当前页保留，刷新或关闭后将丢失。';
+    $('#study-cache-status').hidden = false;
+    $('#study-cache-status').classList.toggle('error', !current.persistent);
+  }
+  async function ensureStudyCache() {
+    if (state.cachePromise) return state.cachePromise;
+    state.cachePromise = (async () => {
+      if (window.studyCache) {
+        cacheNotice(await window.studyCache.init());
+        state.cachedSlides = await window.studyCache.listUploads();
+      }
+      state.cacheReady = true;
+      renderPendingSlides();
+    })();
+    try { await state.cachePromise; }
+    catch (error) { cacheNotice({ persistent: false, message: error.message }); state.cachePromise = null; }
+  }
+  function rememberDraft(sessionId, text) {
+    if (!sessionId) return Promise.resolve();
+    state.draftTexts.set(sessionId, text);
+    state.draftRevision.set(sessionId, (state.draftRevision.get(sessionId) || 0) + 1);
+    const prior = state.draftWrites.get(sessionId) || Promise.resolve();
+    const saving = prior.catch(() => {}).then(async () => {
+      if (window.studyCache) cacheNotice(await window.studyCache.setDraft(sessionId, text));
+    }).catch((error) => cacheNotice({ persistent: false, message: `草稿仅当前页保留：${error.message}` }));
+    state.draftWrites.set(sessionId, saving);
+    return saving;
+  }
+  async function restoreDraft(scope) {
+    const revision = state.draftRevision.get(scope.sessionId) || 0;
+    let draft = state.draftTexts.get(scope.sessionId) || '';
+    if (window.studyCache) {
+      await state.draftWrites.get(scope.sessionId);
+      draft = await window.studyCache.getDraft(scope.sessionId);
+      const request = await window.studyCache.getRequest(scope.sessionId);
+      if (request) state.legacyRequests.set(scope.sessionId, request);
+      else state.legacyRequests.delete(scope.sessionId);
+    }
+    if (inView(scope) && revision === (state.draftRevision.get(scope.sessionId) || 0)) {
+      state.draftTexts.set(scope.sessionId, draft); $('#question-input').value = draft; renderInputLimits();
+      renderLegacyRecovery();
+    }
+  }
+  function clearSentDraft(sessionId, text, scope) {
+    const saved = state.draftTexts.get(sessionId);
+    if (saved === text || (inView(scope) && $('#question-input').value === text)) rememberDraft(sessionId, '');
+    if (inView(scope) && $('#question-input').value === text) $('#question-input').value = '';
+  }
+  function renderLegacyRecovery() {
+    const record = state.legacyRequests.get(state.session?.id);
+    $('#legacy-request-recovery').hidden = !record;
+    $('#legacy-request-check').disabled = state.studyBusy || state.switching;
+    $('#legacy-request-check').textContent = record?.kind === 'study' ? '核对原图文请求' : '核对并重试原问题';
+    if (record) $('#legacy-request-status').textContent = record.error || (record.kind === 'study' ? '此课堂有一个图文请求结果待核对。先核对原任务，不会自动重新调用；需要发送时会再次确认。' : '此课堂有一个提交结果待核对的问题；不会自动再次调用。可手动核对，若后台尚无任务则使用同一标识提交原问题。');
+  }
+  async function rememberLegacyRequest(sessionId, record, expectedRequestId = state.legacyRequests.get(sessionId)?.request_id) {
+    try {
+      if (window.studyCache) cacheNotice(await window.studyCache.setRequest(sessionId, record, expectedRequestId));
+      else if (record && expectedRequestId && expectedRequestId !== record.request_id) throw new Error('本课已有未核对的请求，请先恢复原请求。');
+    } catch (error) {
+      if (window.studyCache) {
+        const current = await window.studyCache.getRequest(sessionId);
+        if (current) state.legacyRequests.set(sessionId, current); else state.legacyRequests.delete(sessionId);
+      }
+      renderLegacyRecovery(); throw error;
+    }
+    if (record) state.legacyRequests.set(sessionId, record); else state.legacyRequests.delete(sessionId);
+    renderLegacyRecovery();
+  }
+  async function submitLegacyQuestion(record, initial = false) {
+    if (state.studyBusy || state.switching) return;
+    const scope = viewScope(record.body.session_id);
+    if (!inView(scope)) return;
+    state.studyBusy = true; renderQueue(); renderSlides(); renderLegacyRecovery();
+    try {
+      await rememberLegacyRequest(scope.sessionId, record);
+      const existing = await api(`/api/requests/${encodeURIComponent(record.request_id)}?session_id=${encodeURIComponent(scope.sessionId)}`);
+      if (!inView(scope)) return;
+      if (!existing.found) {
+        await api('/api/ask', { method: 'POST', body: { ...record.body, request_id: record.request_id } });
+        clearSentDraft(scope.sessionId, record.body.question, scope);
+      }
+      await rememberLegacyRequest(scope.sessionId, null, record.request_id);
+      if (inView(scope) && existing.found) toast('已找到后台的同一任务，未重新调用；当前草稿保留。');
+      await poll(true);
+    } catch (error) {
+      if (state.legacyRequests.get(scope.sessionId)?.request_id === record.request_id) {
+        try { await rememberLegacyRequest(scope.sessionId, { ...record, error: `${error.message}。原请求仍保留，请先核对结果。` }); } catch (_) {}
+      }
+      if (inView(scope)) toast(error.message, true, 8000);
+    } finally { state.studyBusy = false; renderQueue(); renderSlides(); renderLegacyRecovery(); }
+  }
+  async function recoverStudyRequest(record) {
+    if (state.studyBusy || state.switching) return;
+    const scope = viewScope(record.session_id || record.params?.session_id);
+    if (!inView(scope)) return;
+    state.studyBusy = true; renderQueue(); renderSlides(); renderLegacyRecovery();
+    let retryParams = null;
+    try {
+      const found = record.question_id ? { found: true, question: await api(`/api/study/${encodeURIComponent(record.question_id)}?session_id=${encodeURIComponent(scope.sessionId)}`) } : await api(`/api/study/requests/${encodeURIComponent(record.request_id)}?session_id=${encodeURIComponent(scope.sessionId)}`);
+      if (found.found) {
+        await rememberLegacyRequest(scope.sessionId, null, record.request_id);
+        if (inView(scope)) {
+          if (found.question.status === 'prepared') openStudyReview(found.question, scope.sessionId);
+          showStudyStatus(found.question.status === 'prepared' ? '已找到原材料，请确认后发送。' : '已找到后台的同一任务，未重复调用；当前草稿保留。');
+        }
+        await poll(true);
+      } else if (record.params && record.phase === 'prepare') retryParams = record.params;
+      else throw new Error('尚未找到原任务，结果仍待核对；未创建新请求。');
+    } catch (error) { if (inView(scope)) showStudyStatus(error.message, true); }
+    finally { state.studyBusy = false; renderQueue(); renderSlides(); renderLegacyRecovery(); }
+    if (retryParams && inView(scope)) return prepareStudy(retryParams, true);
+  }
+  async function executeLegacyRetry(operation, confirmDuplicate = false) {
+    const { scope, type, id } = operation;
+    if (!inView(scope) || state.studyBusy) return;
+    state.studyBusy = true; renderQueue(); renderSlides();
+    try {
+      await saveSettings();
+      const requestId = operationId(scope.sessionId, `retry-${type}`, id);
+      const found = type === 'audio' ? { found: false } : await api(`/api/requests/${encodeURIComponent(requestId)}?session_id=${encodeURIComponent(scope.sessionId)}`);
+      if (!inView(scope)) return;
+      if (!found.found) await api(`/api/${type}/${encodeURIComponent(id)}/retry`, { method: 'POST', body: { session_id: scope.sessionId, request_id: requestId, confirm_duplicate: confirmDuplicate } });
+      finishOperation(scope.sessionId, `retry-${type}`, id);
+      if (inView(scope)) { $('#duplicate-retry-dialog').close(); state.pendingLegacyRetry = null; }
+      await poll(true);
+      if (inView(scope)) toast(found.found ? '已找到原任务，未重复调用。' : type === 'audio' ? '已加入本机转写队列。' : '已加入 AI 处理队列。');
+    } catch (error) { if (inView(scope)) toast(error.message, true); }
+    finally { state.studyBusy = false; renderQueue(); renderSlides(); }
+  }
+  function pendingSlides() { return [...state.cachedSlides, ...state.transientSlides.values()]; }
+  function renderPendingSlides() {
+    const records = pendingSlides().filter((item) => item.session_id === state.session?.id);
+    $('#pending-slides-panel').hidden = records.length === 0;
+    $('#clear-pending-slides').disabled = state.slideBusy || state.slideRecoveryBusy;
+    $('#pending-slides-list').innerHTML = records.map((item) => {
+      if (!state.slideURLs.has(item.id) && typeof URL.createObjectURL === 'function') state.slideURLs.set(item.id, URL.createObjectURL(item.blob));
+      const preview = state.slideURLs.get(item.id);
+      return `<article class="pending-slide"><div>${preview ? `<img src="${escapeHTML(preview)}" alt="待恢复课件">` : ''}</div><div><strong>${escapeHTML(item.title)}</strong><p class="small">原课堂时间 ${timecode(item.start)} · ${(item.size / 1024 / 1024).toFixed(2)} MiB${item.transient ? ' · 仅当前页保留，未进入本机暂存' : ''}</p><p class="small">${escapeHTML(item.error || '后台结果待核对，未自动重传。')}</p><button type="button" class="text-button" data-upload-retry="${escapeHTML(item.id)}" ${state.slideBusy || state.slideRecoveryBusy ? 'disabled' : ''}>核对并重试</button><button type="button" class="text-button" data-upload-clear="${escapeHTML(item.id)}" ${state.slideBusy || state.slideRecoveryBusy ? 'disabled' : ''}>清除暂存</button></div></article>`;
+    }).join('');
+  }
+  async function updatePendingSlide(record) {
+    if (record.transient) state.transientSlides.set(record.id, record);
+    else {
+      cacheNotice(await window.studyCache.putUpload(record));
+      state.cachedSlides = await window.studyCache.listUploads();
+    }
+    renderPendingSlides();
+  }
+  async function clearPendingSlide(id) {
+    if (state.transientSlides.has(id)) state.transientSlides.delete(id);
+    else { cacheNotice(await window.studyCache.deleteUpload(id)); state.cachedSlides = await window.studyCache.listUploads(); }
+    if (state.slideURLs.has(id)) { URL.revokeObjectURL?.(state.slideURLs.get(id)); state.slideURLs.delete(id); }
+    renderPendingSlides();
+  }
+  async function recoverSlide(record, firstAttempt = false) {
+    if (!record || state.slideBusy || state.switching || state.slideRecoveryBusy) return;
+    const scope = viewScope(record.session_id);
+    if (!inView(scope)) return;
+    state.slideBusy = true; renderSlides(); renderQueue(); renderPendingSlides();
+    if (inView(scope)) { $('#slide-status').hidden = false; $('#slide-status').textContent = '正在核对后台保存状态…'; }
+    try {
+      if (record.transient && window.studyCache) {
+        const persistentCandidate = { ...record }; delete persistentCandidate.transient;
+        try {
+          cacheNotice(await window.studyCache.putUpload(persistentCandidate));
+          state.transientSlides.delete(record.id); state.cachedSlides = await window.studyCache.listUploads(); record = persistentCandidate;
+        } catch (error) { cacheNotice({ persistent: false, message: `${error.message}。正在手动重试的图片仍仅当前页保留。` }); }
+      }
+      const result = await api(`/api/slides/requests/${encodeURIComponent(record.id)}?session_id=${encodeURIComponent(record.session_id)}`);
+      if (result.found) {
+        if (result.available !== true) throw new Error('后台记录已存在，但图片缺失或损坏；原图片暂存仍保留，请先核对，未重复上传。');
+      } else {
+        await updatePendingSlide({ ...record, status: 'pending', error: '' });
+        const query = new URLSearchParams({ session_id: record.session_id, start: String(record.start), title: record.title, request_id: record.id });
+        await api(`/api/slides?${query}`, { method: 'POST', headers: { 'Content-Type': record.mime_type }, body: record.blob });
+        const receipt = await api(`/api/slides/requests/${encodeURIComponent(record.id)}?session_id=${encodeURIComponent(record.session_id)}`);
+        if (!receipt.found || receipt.available !== true) throw new Error('尚未确认后台图片已保存且可查看；暂存保留，重试会先核对结果。');
+      }
+      await clearPendingSlide(record.id);
+      if (inView(scope)) { $('#slide-file').value = ''; $('#slide-status').textContent = `后台已确认保存，原起点 ${timecode(record.start)}；可编辑对应课堂范围。`; }
+      await poll(true);
+    } catch (error) {
+      const message = error.resultUnknown ? '请求超时、无法确定服务商是否已处理' : error.message;
+      try { await updatePendingSlide({ ...record, status: error.resultUnknown ? 'unknown' : 'failed', error: message }); } catch (cacheError) { cacheNotice({ persistent: false, message: cacheError.message }); }
+      if (inView(scope)) { $('#slide-status').textContent = `${message}。图片保留在待恢复列表，请手动核对并重试。`; $('#slide-status').hidden = false; }
+    } finally { state.slideBusy = false; renderSlides(); renderQueue(); renderPendingSlides(); }
+  }
+
   // Classroom time follows captured samples, never wall time. Capture the value
   // synchronously at the user's click, before any settings/network await.
   function classroomAnchor() {
@@ -331,21 +544,29 @@
     return Math.max(0, state.clockSeconds || 0, ...(state.session?.segments || []).map((item) => Number(item.end) || 0), ...(state.session?.audio || []).map((item) => (Number(item.start) || 0) + (Number(item.duration) || 0)));
   }
 
-  const slideURL = (id, sessionId) => `/api/slides/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionId)}`;
+  const slideURL = (id, sessionId, slide = null) => `/api/slides/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionId)}${slide ? `&version=${encodeURIComponent(slide.version || 1)}${slide.sha256 ? `&sha256=${encodeURIComponent(slide.sha256)}` : ''}` : ''}`;
   const rangeText = (range) => range?.start != null ? `${timecode(range.start)} — ${range.end == null ? '持续中' : timecode(range.end)}` : '暂无已转写原文';
 
   function evidenceHTML(question, sessionId) {
     const evidence = question.evidence || {};
     const slides = evidence.slides || [];
     const warnings = evidence.warnings || [];
-    return `<div class="study-evidence"><p><strong>请求范围</strong> ${escapeHTML(rangeText(evidence.requested_range))}<br><strong>实际原文范围</strong> ${escapeHTML(rangeText(evidence.actual_range))}</p>${evidence.incomplete ? '<p class="review-note">尚不能确认原文完整，回答只能依据当前已收到的材料。之后可选择「补齐 / 用新材料解释」。</p>' : ''}${warnings.map((warning) => `<p class="review-note">${escapeHTML(warning)}</p>`).join('')}<div class="evidence-slides">${slides.map((slide) => `<figure><a href="${slideURL(slide.id, sessionId)}" target="_blank" rel="noopener"><img src="${slideURL(slide.id, sessionId)}" alt="${escapeHTML(slide.title || slide.id)}" loading="lazy"></a><figcaption>${escapeHTML(slide.title || slide.id)} · ${escapeHTML(rangeText(slide))}</figcaption></figure>`).join('')}</div>${(evidence.segments || []).map((segment) => `<div class="evidence-segment"><span class="timecode">${escapeHTML(rangeText(segment))} · ${escapeHTML(segment.id || '')}</span><p>${escapeHTML(segment.text)}</p></div>`).join('') || '<p class="small muted">此快照没有可用的课堂原文。</p>'}</div>`;
+    const statuses = question.source_status?.slides || [];
+    const changes = (question.source_status?.messages || []).map((message) => `<p class="review-note">${escapeHTML(message)}</p>`).join('');
+    const pictures = slides.map((slide) => {
+      const info = statuses.find((item) => item.id === slide.id && (item.version || 1) === (slide.version || 1));
+      const missing = info?.available === false || ['missing', 'corrupt', 'invalid'].includes(info?.availability);
+      const url = slideURL(slide.id, sessionId, slide);
+      return `<figure>${missing ? '<div class="unavailable-slide">历史图片缺失或损坏，无法查看；不会用新图替代。</div>' : `<a href="${url}" target="_blank" rel="noopener"><img src="${url}" alt="${escapeHTML(slide.title || slide.id)}" loading="lazy"></a>`}<figcaption>${escapeHTML(slide.title || slide.id)} · v${escapeHTML(slide.version || 1)} · ${escapeHTML(rangeText(slide))}${info?.removed ? ' · 已从课堂选择移除，历史副本保留' : ''}${info?.rotated ? ' · 之后已调整方向，此处为原图' : ''}${info?.time_changed ? ' · 之后已修改时间，此处为原范围' : ''}${info?.message ? ` · ${escapeHTML(info.message)}` : ''}</figcaption></figure>`;
+    }).join('');
+    return `<div class="study-evidence"><p><strong>请求范围</strong> ${escapeHTML(rangeText(evidence.requested_range))}<br><strong>实际原文范围</strong> ${escapeHTML(rangeText(evidence.actual_range))}</p>${changes}${evidence.incomplete ? '<p class="review-note">尚不能确认原文完整，回答只能依据当前已收到的材料。之后可选择「补齐 / 用新材料解释」。</p>' : ''}${warnings.map((warning) => `<p class="review-note">${escapeHTML(warning)}</p>`).join('')}<div class="evidence-slides">${pictures}</div>${(evidence.segments || []).map((segment) => `<div class="evidence-segment"><span class="timecode">${escapeHTML(rangeText(segment))} · ${escapeHTML(segment.id || '')}</span><p>${escapeHTML(segment.text)}</p></div>`).join('') || '<p class="small muted">此快照没有可用的课堂原文。</p>'}</div>`;
   }
 
   function studyActions(question) {
     if (!question.study || isDemo()) return '';
     const id = escapeHTML(question.id);
     const pending = isPending(question.status);
-    return `<div class="study-actions">${question.status === 'prepared' ? `<button class="button subtle" data-study-review="${id}">确认发送</button>` : ''}${!pending && (question.error || question.stream_status === 'interrupted') ? `<button class="text-button" data-study-retry="${id}">重试原材料</button>` : ''}${!pending && question.status !== 'prepared' ? `<button class="text-button" data-study-refresh="${id}">补齐 / 用新材料解释</button>` : ''}</div><details class="evidence-details" data-evidence="${id}"><summary>查看本次依据 · ${(question.evidence?.slides || []).length} 张课件</summary>${evidenceHTML(question, state.session.id)}</details>`;
+    return `${resultUnknown(question) ? '<p class="analysis-error">请求超时、无法确定服务商是否已处理</p><p class="small muted">不会自动再次调用。主动重新请求可能重复计费。</p>' : ''}<div class="study-actions">${question.status === 'prepared' ? `<button class="button subtle" data-study-review="${id}">确认发送</button>` : ''}${!pending && (question.error || question.stream_status === 'interrupted' || resultUnknown(question)) ? `<button class="text-button" data-study-retry="${id}">重试原材料</button>` : ''}${!pending && question.status !== 'prepared' ? `<button class="text-button" data-study-refresh="${id}">补齐 / 用新材料解释</button>` : ''}</div><details class="evidence-details" data-evidence="${id}"><summary>查看本次依据 · ${(question.evidence?.slides || []).length} 张课件</summary>${evidenceHTML(question, state.session.id)}</details>`;
   }
 
   function showStudyStatus(message, error = false) {
@@ -356,49 +577,92 @@
   }
 
   function renderSlides() {
-    const slides = state.session?.slides || [];
+    const slides = (state.session?.slides || []).filter((item) => !item.removed && !item.removed_at);
     $('#slides-count').textContent = slides.length;
     $('#slides-auto').checked = state.slideSelection === null;
     $('#slides-selection-note').textContent = state.slideSelection === null ? '自动按范围选择' : `已手选 ${state.slideSelection.size} 张（最多 4 张）`;
     $('#include-slides').checked = state.includeImagesPreference ?? slides.length > 0;
     $('#study-range-label').hidden = !$('#include-slides').checked;
-    $('#slide-file').disabled = state.slideBusy || isDemo() || !state.connected;
+    $('#slide-file').disabled = state.slideBusy || state.slideRecoveryBusy || state.switching || isDemo() || !state.connected;
     $('#slides-auto').disabled = state.studyBusy;
     const key = JSON.stringify([state.session?.id, slides, state.slideSelection === null ? null : [...state.slideSelection], state.studyBusy]);
     const html = slides.map((slide) => `<article class="slide-card"><label><input type="checkbox" data-slide-select="${escapeHTML(slide.id)}" ${state.slideSelection?.has(slide.id) ? 'checked' : ''} ${state.slideSelection === null || state.studyBusy ? 'disabled' : ''}><span>${escapeHTML(slide.title || slide.id)}</span></label><button class="slide-thumbnail" data-slide-edit="${escapeHTML(slide.id)}" aria-label="查看 ${escapeHTML(slide.title || slide.id)}"><img src="${slideURL(slide.id, state.session.id)}" alt="${escapeHTML(slide.title || slide.id)}" loading="lazy"></button><div class="slide-caption"><span class="timecode">${escapeHTML(rangeText(slide))}</span><button class="text-button" data-slide-edit="${escapeHTML(slide.id)}">编辑范围</button></div></article>`).join('');
     replaceList('#slides-gallery', html || '<p class="small muted">还没有课件。可添加老师的幻灯片、板书照片或截图。</p>', key);
-    for (const button of document.querySelectorAll('[data-study-mode]')) button.disabled = state.studyBusy || isDemo() || !state.connected;
+    for (const button of document.querySelectorAll('[data-study-mode]')) button.disabled = state.studyBusy || state.switching || isDemo() || !state.connected;
     $('#study-reprepare').disabled = state.studyBusy;
+    renderPendingSlides();
   }
 
   async function uploadSlide(file) {
-    if (!file || state.slideBusy || !state.session) return;
+    if (!file || state.slideBusy || state.slideRecoveryBusy || state.switching || !state.session) return;
     if (isDemo()) { toast('请新建真实课程后添加课件。', true); return; }
     if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) { toast('请选择 PNG、JPEG 或 WebP 图片，一次一张。', true); return; }
-    const sessionId = state.session.id;
-    const start = classroomAnchor();
-    state.slideBusy = true; renderSlides(); renderQueue();
-    $('#slide-status').hidden = false; $('#slide-status').textContent = '正在保存图片到本机…';
+    const scope = viewScope();
+    const record = { id: newRequestId(), session_id: scope.sessionId, start: classroomAnchor(), title: file.name || '粘贴的课件', blob: file, mime_type: file.type, size: file.size, created_at: new Date().toISOString(), status: 'pending', error: '' };
+    state.slideRecoveryBusy = true; renderSlides(); renderQueue();
     try {
-      const query = new URLSearchParams({ session_id: sessionId, start: String(start), title: file.name || '粘贴的课件' });
-      await api(`/api/slides?${query}`, { method: 'POST', headers: { 'Content-Type': file.type }, body: file });
-      $('#slide-file').value = '';
-      $('#slide-status').textContent = `已保存，起点 ${timecode(start)}；可编辑对应课堂范围。`;
-      await poll(true);
-    } catch (error) { $('#slide-status').textContent = `图片未保存：${error.message}。原选择保留，可重试。`; toast(error.message, true); }
-    finally { state.slideBusy = false; renderSlides(); renderQueue(); }
+      await ensureStudyCache();
+      if (!window.studyCache) throw new Error('本机图片暂存组件未加载，请刷新后重试。');
+      try { await updatePendingSlide(record); }
+      catch (error) {
+        if (state.transientSlides.size) throw new Error(`${error.message}。当前页已有一张尚未入库的图片，请先处理；旧项未被覆盖。`);
+        record.transient = true; record.error = `${error.message}。此图仅当前页保留，未自动上传；请清理暂存后手动重试。`;
+        state.transientSlides.set(record.id, record); renderPendingSlides();
+        if (inView(scope)) cacheNotice({ persistent: false, message: record.error });
+        return;
+      }
+      if (inView(scope)) $('#slide-file').value = '';
+    } catch (error) { if (inView(scope)) toast(error.message, true); return; }
+    finally { state.slideRecoveryBusy = false; renderSlides(); renderQueue(); }
+    if (inView(scope)) return recoverSlide(record, true);
   }
 
   function editSlide(id) {
     const slide = state.session?.slides?.find((item) => item.id === id);
     if (!slide || state.slideBusy) return;
-    state.editingSlide = { id, sessionId: state.session.id };
-    $('#slide-preview').src = slideURL(id, state.session.id);
+    state.editingSlide = { id, sessionId: state.session.id, epoch: state.sessionEpoch, slide: { ...slide }, rotation: 0, rotationRequest: null };
+    $('#slide-preview').src = slideURL(id, state.session.id, slide);
+    $('#slide-preview').style.transform = '';
+    $('#slide-save-rotation').disabled = true;
     $('#slide-title').value = slide.title || '';
     $('#slide-start').value = String(slide.start || 0);
     $('#slide-end').value = slide.end == null ? '' : String(slide.end);
     $('#slide-edit-status').hidden = true;
     $('#slide-dialog').showModal();
+  }
+
+  function previewRotation(delta) {
+    const editing = state.editingSlide;
+    if (!editing || state.slideBusy || !inView(editing)) return;
+    editing.rotation = (editing.rotation + delta + 360) % 360;
+    $('#slide-preview').style.transform = `rotate(${editing.rotation}deg)`;
+    $('#slide-save-rotation').disabled = editing.rotation === 0;
+  }
+  async function saveRotation() {
+    const editing = state.editingSlide;
+    if (!editing || state.slideBusy || !editing.rotation || !inView(editing)) return;
+    const requestId = operationId(editing.sessionId, 'rotate', `${editing.id}:${editing.slide.version || 1}:${editing.rotation}`);
+    state.slideBusy = true; renderSlides(); renderQueue();
+    $('#slide-save-rotation').disabled = true;
+    try {
+      const existing = await api(`/api/slides/requests/${encodeURIComponent(requestId)}?session_id=${encodeURIComponent(editing.sessionId)}`);
+      if (existing.found && !existing.available) throw new Error('此方向版本已有记录，但文件不可查看，请先核对，未重复旋转。');
+      if (!existing.found) await api(`/api/slides/${encodeURIComponent(editing.id)}/rotate`, { method: 'POST', body: { session_id: editing.sessionId, degrees: editing.rotation, request_id: requestId } });
+      if (inView(editing) && state.editingSlide === editing) { $('#slide-dialog').close(); $('#slide-status').hidden = false; $('#slide-status').textContent = '方向已保存为新版本，历史回答继续使用原图。'; }
+      await poll(true);
+    } catch (error) { if (inView(editing) && state.editingSlide === editing) { $('#slide-edit-status').textContent = `${error.message}。再次保存会先核对原请求。`; $('#slide-edit-status').hidden = false; } }
+    finally { state.slideBusy = false; if (state.editingSlide === editing) $('#slide-save-rotation').disabled = !editing.rotation; renderSlides(); renderQueue(); }
+  }
+  async function removeSlide() {
+    const editing = state.editingSlide;
+    if (!editing || state.slideBusy || !inView(editing)) return;
+    state.slideBusy = true; renderSlides(); renderQueue();
+    try {
+      await api(`/api/slides/${encodeURIComponent(editing.id)}?session_id=${encodeURIComponent(editing.sessionId)}`, { method: 'DELETE' });
+      if (inView(editing) && state.editingSlide === editing) { state.slideSelection?.delete(editing.id); $('#slide-dialog').close(); $('#slide-status').hidden = false; $('#slide-status').textContent = '课件已从本课的新问题选择中移除，历史图片副本仍保留。'; }
+      await poll(true);
+    } catch (error) { if (inView(editing) && state.editingSlide === editing) { $('#slide-edit-status').textContent = error.message; $('#slide-edit-status').hidden = false; } }
+    finally { state.slideBusy = false; renderSlides(); renderQueue(); }
   }
 
   function frozenStudyParams(mode, question = '', explain = true) {
@@ -413,7 +677,7 @@
     // Only identities/versions leave the browser. The server reconstructs and
     // validates its own stored source, rather than trusting client text.
     if (!Array.isArray(params.seen_segments)) params.seen_segments = segments.map((item) => ({ id: item.id, version: item.version || 0 }));
-    if (!Array.isArray(params.seen_slides)) params.seen_slides = (state.session?.slides || []).map((item) => ({ id: item.id, sha256: item.sha256, start: item.start, end: item.end ?? null, title: item.title || '' }));
+    if (!Array.isArray(params.seen_slides)) params.seen_slides = (state.session?.slides || []).filter((item) => !item.removed && !item.removed_at).map((item) => ({ id: item.id, version: item.version || 1, interval_version: item.interval_version || 0, sha256: item.sha256, start: item.start, end: item.end ?? null, title: item.title || '' }));
     if (params.mode !== 'group' || Array.isArray(params.seen_group_segment_ids)) return true;
     const groups = state.session?.groups || [];
     let group = params.group_id ? groups.find((item) => item.id === params.group_id) : null;
@@ -440,36 +704,68 @@
     const destination = question.destination || {};
     const hasImages = Boolean(question.evidence?.slides?.length);
     const unsupported = hasImages && question.vision?.state === 'unsupported';
+    const changed = Boolean(question.source_status?.changed);
+    const unavailable = Boolean(question.source_status?.unavailable);
+    const duplicate = resultUnknown(question);
     const visionText = !hasImages ? '本次仅发送原文。' : unsupported ? '此配置已明确不支持图片，不能带图发送。可选择「仅用原文」，保留同一份原文快照。' : question.vision?.state === 'supported' ? question.vision.message || '此配置曾完成同数量图片的请求，不代表本次一定成功或答案正确。' : '图片能力未知：此配置尚未确认支持图片，发送可能失败。';
     $('#study-review').innerHTML = `<dl class="study-destination"><dt>接入</dt><dd>${escapeHTML(destination.label || providerLabel(destination.provider))} (${escapeHTML(destination.provider || '')})</dd><dt>地址</dt><dd>${escapeHTML(destination.base_url || '本机 Codex · 当前登录账号')}</dd><dt>模型</dt><dd>${escapeHTML(destination.model || 'Codex 当前配置模型')}</dd></dl><p class="${unsupported || question.vision?.state === 'unknown' ? 'review-note' : 'dialog-help'}">${escapeHTML(visionText)}</p><p class="study-review-question"><strong>问题</strong><br>${escapeHTML(question.question)}</p>${evidenceHTML(question, review.sessionId)}`;
-    $('#study-send').disabled = state.studyBusy || unsupported || question.status !== 'prepared';
+    $('#study-original-label').hidden = !changed;
+    $('#study-duplicate-label').hidden = !duplicate;
+    $('#study-refresh-materials').hidden = !changed;
+    $('#study-refresh-materials').disabled = state.studyBusy;
+    const blocked = unavailable || unsupported;
+    $('#study-send').disabled = state.studyBusy || (!review.action && blocked) || (!review.action && question.status !== 'prepared') || (changed && !$('#study-confirm-original').checked && !review.action) || (duplicate && !$('#study-confirm-duplicate').checked);
+    $('#study-send').textContent = review.action ? '确认重新请求' : changed ? '确认使用原快照' : '确认发送';
     $('#study-text-only').disabled = state.studyBusy;
-    $('#study-text-only').hidden = !hasImages;
+    $('#study-text-only').hidden = !hasImages || Boolean(review.action);
     $('#study-remember-label').hidden = !hasImages || unsupported;
     $('#study-remember').disabled = state.studyBusy || unsupported;
   }
 
-  function openStudyReview(question, sessionId = state.session.id) {
-    state.studyReview = { question, sessionId };
+  function openStudyReview(question, sessionId = state.session.id, options = {}) {
+    if (state.session?.id !== sessionId) return;
+    state.studyReview = { question, sessionId, scope: viewScope(sessionId), ...options };
     $('#study-remember').checked = false;
+    $('#study-confirm-original').checked = false;
+    $('#study-confirm-duplicate').checked = options.duplicateAccepted === true;
     $('#study-send-status').hidden = true;
     renderStudyReview();
     if (!$('#study-dialog').open) $('#study-dialog').showModal();
   }
 
-  async function sendPrepared(question, sessionId, confirmImages = false, remember = false) {
+  async function sendPrepared(question, sessionId, confirmImages = false, remember = false, flags = {}, scope = viewScope(sessionId)) {
     if (question.evidence?.slides?.length && question.vision?.state === 'unsupported') throw new Error('此配置不支持图片，请选择「仅用原文」。');
-    await api(`/api/study/${encodeURIComponent(question.id)}/send`, { method: 'POST', body: { session_id: sessionId, destination_token: question.destination?.token, confirm_images: confirmImages, remember } });
+    if (question.source_status?.unavailable) throw new Error('历史材料缺失或损坏，不能带图发送；可仅用原文或重新取材。');
+    if (question.source_status?.changed && !flags.confirm_original) throw new Error('材料已有修改，请再次确认原快照或重新取材。');
+    if (resultUnknown(question) && !flags.confirm_duplicate) throw new Error('请求超时、无法确定服务商是否已处理。重新请求前请确认可能重复计费。');
+    const prior = state.legacyRequests.get(sessionId);
+    const requestId = question.request_id || (prior?.kind === 'study' && prior.question_id === question.id ? prior.request_id : null) || operationId(sessionId, 'study-send', question.id);
+    if (prior && prior.request_id !== requestId) throw new Error('本课另有未核对的请求，请先核对原请求，当前材料保留。');
+    const receipt = { ...(prior || {}), kind: 'study', request_id: requestId, session_id: sessionId, question_id: question.id, phase: 'send' };
+    await rememberLegacyRequest(sessionId, receipt);
+    try {
+      await api(`/api/study/${encodeURIComponent(question.id)}/send`, { method: 'POST', body: { session_id: sessionId, destination_token: question.destination?.token, confirm_images: confirmImages, remember, source_token: question.source_status?.token, ...flags } });
+      await rememberLegacyRequest(sessionId, null, requestId);
+    } catch (error) {
+      if ([400, 403, 409, 422].includes(error.status)) await rememberLegacyRequest(sessionId, null, requestId);
+      else { try { await rememberLegacyRequest(sessionId, { ...receipt, error: `${error.message}。请先核对原任务，不要直接创建新请求。` }); } catch (_) {} }
+      throw error;
+    }
     const draftKey = `${sessionId}:${question.id}`;
     const draft = state.studyDrafts.get(draftKey);
-    if (draft != null && state.session?.id === sessionId && $('#question-input').value === draft) $('#question-input').value = '';
+    if (draft != null) clearSentDraft(sessionId, draft, scope);
     state.studyDrafts.delete(draftKey);
-    if (state.studyReview?.question.id === question.id) { $('#study-dialog').close(); state.studyReview = null; }
-    showStudyStatus('已加入 AI 队列，提问时的材料已固定。');
+    if (inView(scope) && state.studyReview?.sessionId === sessionId && state.studyReview.question.id === question.id) { $('#study-dialog').close(); state.studyReview = null; }
+    if (inView(scope)) showStudyStatus('已加入 AI 队列，提问时的材料已固定。');
   }
 
-  async function prepareStudy(params) {
-    if (state.studyBusy) return;
+  async function prepareStudy(params, reviewOnly = false) {
+    if (state.studyBusy || state.switching) return;
+    const scope = viewScope(params.session_id);
+    if (!inView(scope)) return;
+    params.request_id ||= newRequestId();
+    const pending = state.legacyRequests.get(params.session_id);
+    if (pending && pending.request_id !== params.request_id) { showStudyStatus('本课还有结果待核对的请求，请先核对原任务。', true); return; }
     if (isDemo()) { toast('演示课程不调用 AI，请先新建真实课程。'); return; }
     // Freeze before saveSettings or prepare can yield. On a selection retry the
     // original metadata remains intact; only an explicit refresh captures anew.
@@ -480,61 +776,91 @@
     state.studyFailedParams = null; showStudyStatus('正在固定课堂原文与课件…');
     let prepared = null;
     try {
+      await rememberLegacyRequest(params.session_id, { kind: 'study', request_id: params.request_id, session_id: params.session_id, params, phase: 'prepare' });
       await saveSettings();
-      prepared = await api('/api/study/prepare', { method: 'POST', body: params });
+      const existing = await api(`/api/study/requests/${encodeURIComponent(params.request_id)}?session_id=${encodeURIComponent(params.session_id)}`);
+      prepared = existing.found ? existing.question : await api('/api/study/prepare', { method: 'POST', body: params });
+      await rememberLegacyRequest(params.session_id, { kind: 'study', request_id: params.request_id, session_id: params.session_id, params, phase: 'prepare', question_id: prepared.id });
       if (!params.explain) state.studyDrafts.set(`${params.session_id}:${prepared.id}`, params.question);
+      if (!inView(scope)) { await rememberLegacyRequest(params.session_id, null, params.request_id); await poll(true); return; }
+      if (prepared.status !== 'prepared') { await rememberLegacyRequest(params.session_id, null, params.request_id); showStudyStatus('已找到此前的同一任务，未重复调用。'); await poll(true); return; }
       const hasImages = Boolean(prepared.evidence?.slides?.length);
-      if (hasImages && (prepared.requires_confirmation || prepared.vision?.state === 'unsupported')) {
+      if (reviewOnly || hasImages && (prepared.requires_confirmation || prepared.vision?.state === 'unsupported') || prepared.source_status?.changed || prepared.source_status?.unavailable || resultUnknown(prepared)) {
+        await rememberLegacyRequest(params.session_id, null, params.request_id);
         openStudyReview(prepared, params.session_id);
         showStudyStatus('材料已固定，确认发送后开始解释。');
-      } else await sendPrepared(prepared, params.session_id);
+      } else await sendPrepared(prepared, params.session_id, false, false, {}, scope);
       await poll(true);
     } catch (error) {
-      if (prepared) openStudyReview(prepared, params.session_id);
-      else state.studyFailedParams = params;
-      showStudyStatus(error.message, true);
-      if (error.status === 422 && /4.*张|超过\s*4|最多\s*4|至多\s*4/.test(error.message)) { $('#slides-panel').open = true; toast(`${error.message} 请在课件中关闭自动选择并手动勾选，然后重试同一时间段。`, true, 9000); }
+      if (!prepared && [400, 403, 422].includes(error.status) && state.legacyRequests.get(params.session_id)?.request_id === params.request_id) await rememberLegacyRequest(params.session_id, null, params.request_id);
+      if (inView(scope)) {
+        if (prepared) openStudyReview(prepared, params.session_id);
+        else state.studyFailedParams = params;
+        showStudyStatus(error.message, true);
+        if (error.status === 422 && /4.*张|超过\s*4|最多\s*4|至多\s*4/.test(error.message)) { $('#slides-panel').open = true; toast(`${error.message} 请在课件中关闭自动选择并手动勾选，然后重试同一时间段。`, true, 9000); }
+      }
     } finally { state.studyBusy = false; renderSlides(); renderQueue(); renderStudyReview(); }
   }
 
   async function confirmStudy(textOnly = false) {
     if (state.studyBusy || !state.studyReview) return;
     const review = state.studyReview;
+    if (!inView(review.scope)) return;
+    if (textOnly && state.legacyRequests.has(review.sessionId)) { $('#study-send-status').textContent = '前一次发送结果仍待核对，请先核对原请求，再选择仅用原文。'; $('#study-send-status').hidden = false; return; }
     let question = review.question;
+    const duplicateAccepted = $('#study-confirm-duplicate').checked;
+    if (resultUnknown(question) && !duplicateAccepted) { $('#study-send-status').textContent = '请求超时、无法确定服务商是否已处理。请确认可能重复计费后再请求。'; $('#study-send-status').hidden = false; return; }
+    if (review.action === 'retry') return retryStudy(question, duplicateAccepted);
+    if (review.action === 'refresh') return refreshStudy(question, duplicateAccepted);
+    const originalAccepted = $('#study-confirm-original').checked;
     state.studyBusy = true; renderStudyReview(); renderQueue();
     $('#study-send-status').hidden = false; $('#study-send-status').textContent = '正在提交…';
     try {
       if (textOnly) {
         const originalId = question.id;
-        question = await api(`/api/study/${encodeURIComponent(originalId)}/text-only`, { method: 'POST', body: { session_id: review.sessionId } });
+        const requestId = operationId(review.sessionId, 'text-only', originalId);
+        const found = await api(`/api/study/requests/${encodeURIComponent(requestId)}?session_id=${encodeURIComponent(review.sessionId)}`);
+        question = found.found ? found.question : await api(`/api/study/${encodeURIComponent(originalId)}/text-only`, { method: 'POST', body: { session_id: review.sessionId, request_id: requestId, confirm_duplicate: duplicateAccepted } });
         const draftKey = `${review.sessionId}:${originalId}`;
         if (state.studyDrafts.has(draftKey)) state.studyDrafts.set(`${review.sessionId}:${question.id}`, state.studyDrafts.get(draftKey));
-        state.studyReview = { question, sessionId: review.sessionId };
+        if (!inView(review.scope)) { await poll(true); return; }
+        state.studyReview = { question, sessionId: review.sessionId, scope: review.scope };
+        if (question.status !== 'prepared') { $('#study-dialog').close(); state.studyReview = null; await poll(true); return; }
+        if (question.source_status?.changed) { openStudyReview(question, review.sessionId, { duplicateAccepted }); return; }
       }
-      await sendPrepared(question, review.sessionId, !textOnly, !textOnly && $('#study-remember').checked);
+      await sendPrepared(question, review.sessionId, !textOnly, !textOnly && $('#study-remember').checked, { confirm_original: originalAccepted, confirm_duplicate: duplicateAccepted }, review.scope);
       await poll(true);
     } catch (error) {
-      $('#study-send-status').textContent = error.message;
-      $('#study-send-status').hidden = false;
+      if (inView(review.scope)) { $('#study-send-status').textContent = error.message; $('#study-send-status').hidden = false; }
       await poll(true); // Refresh a changed destination; never resend automatically.
     } finally { state.studyBusy = false; renderStudyReview(); renderSlides(); renderQueue(); }
   }
 
-  async function retryStudy(question) {
+  async function retryStudy(question, confirmDuplicate = false) {
     if (state.studyBusy) return;
     const sessionId = state.session.id;
+    if (state.legacyRequests.has(sessionId)) { showStudyStatus('本课还有结果待核对的请求，请先核对原任务，再主动重试。', true); return; }
+    const scope = viewScope(sessionId);
+    if (resultUnknown(question) && !confirmDuplicate) { openStudyReview(question, sessionId, { action: 'retry' }); return; }
     state.studyBusy = true; renderSlides(); renderQueue();
     try {
-      const prepared = await api(`/api/study/${encodeURIComponent(question.id)}/retry`, { method: 'POST', body: { session_id: sessionId } });
-      openStudyReview(prepared, sessionId); // Retrying always requires an explicit send.
-      showStudyStatus('已保留原材料快照，请确认后重试。');
+      const requestId = operationId(sessionId, 'retry', question.id);
+      const found = await api(`/api/study/requests/${encodeURIComponent(requestId)}?session_id=${encodeURIComponent(sessionId)}`);
+      const prepared = found.found ? found.question : await api(`/api/study/${encodeURIComponent(question.id)}/retry`, { method: 'POST', body: { session_id: sessionId, request_id: requestId, confirm_duplicate: confirmDuplicate } });
+      if (inView(scope)) {
+        if (prepared.status === 'prepared') openStudyReview(prepared, sessionId, { duplicateAccepted: confirmDuplicate });
+        showStudyStatus(prepared.status === 'prepared' ? '已保留原材料快照，请确认后重试。' : '已找到此前的同一任务，未重复调用。');
+      }
       await poll(true);
-    } catch (error) { showStudyStatus(error.message, true); }
+    } catch (error) { if (inView(scope)) showStudyStatus(error.message, true); }
     finally { state.studyBusy = false; renderStudyReview(); renderSlides(); renderQueue(); }
   }
 
-  function refreshStudy(question) {
+  function refreshStudy(question, confirmDuplicate = false) {
+    if (state.legacyRequests.has(state.session?.id)) { showStudyStatus('本课还有结果待核对的请求，请先核对原任务，再重新取材。', true); return; }
+    if (resultUnknown(question) && !confirmDuplicate) { openStudyReview(question, state.session.id, { action: 'refresh' }); return; }
     const params = { ...question.request_params, session_id: state.session.id, anchor: question.evidence?.requested_range?.end, question: question.question, explain: question.explain !== false };
+    delete params.request_id;
     for (const key of ['seen_segments', 'seen_slides', 'seen_group_segment_ids']) delete params[key];
     if (!Number.isFinite(params.anchor)) { showStudyStatus('这条记录没有有效的原始时间范围，无法补齐。', true); return; }
     if (!params.mode) params.mode = question.group_id ? 'group' : 'recent120';
@@ -590,6 +916,7 @@
     renderEngineStatus();
     renderAISettingsStatus();
     renderAIUsage();
+    renderLegacyRecovery();
     updateAIFormControls();
     renderSlides();
     if (state.studyReview?.sessionId === session.id) {
@@ -599,6 +926,10 @@
           $('#study-remember').checked = false;
           $('#study-send-status').textContent = 'AI 目的地已变化，请核对新地址和模型后重新确认。';
           $('#study-send-status').hidden = false;
+        }
+        if (current.source_status?.token !== state.studyReview.question.source_status?.token) {
+          $('#study-confirm-original').checked = false;
+          if (current.source_status?.changed) { $('#study-send-status').textContent = '材料已有修改，请核对原快照，或选择重新取材。'; $('#study-send-status').hidden = false; }
         }
         state.studyReview.question = current;
         renderStudyReview();
@@ -755,7 +1086,7 @@
       $('#audio-queue-text').textContent = `${queue.length} 段音频待发送（${Math.ceil(duration)} 秒）${failure ? `：${failure.error}` : state.uploadPromise ? ' · 正在传到本机服务' : ' · 等待发送'}${state.db ? ' · 已暂存浏览器' : ' · 仅暂存在当前页面'}`;
       $('#retry-audio').hidden = !state.uploadPaused;
     }
-    const busy = state.captureMode !== 'idle' || queue.length > 0 || state.finalizing.size > 0 || state.switching || state.slideBusy || state.studyBusy;
+    const busy = state.captureMode !== 'idle' || queue.length > 0 || state.finalizing.size > 0 || state.switching || state.slideBusy || state.slideRecoveryBusy || state.studyBusy;
     $('#session-select').disabled = busy;
     $('#new-session').disabled = busy;
     $('#demo-button').disabled = busy;
@@ -810,6 +1141,7 @@
     try {
       const snapshot = await api('/api/state', { timeout: 10000 });
       const previousSession = state.session?.id;
+      if (previousSession && previousSession !== snapshot.session?.id) rememberDraft(previousSession, $('#question-input').value);
       state.snapshot = snapshot;
       state.session = snapshot.session;
       state.connected = true;
@@ -817,19 +1149,29 @@
       $('#connection-dot').className = 'connection-dot ready';
       $('#connection-label').textContent = '已连接本地服务';
       if (previousSession !== state.session?.id) {
+        state.sessionEpoch++;
         state.selectedGroup = null;
         state.slideSelection = null;
         state.includeImagesPreference = null;
         state.studyFailedParams = null;
         state.studyReview = null;
+        state.editingSlide = null;
+        state.editingSegment = null;
+        state.pendingLegacyRetry = null;
         $('#study-dialog').close();
         $('#slide-dialog').close();
+        $('#edit-segment-dialog').close();
+        $('#duplicate-retry-dialog').close();
+        $('#slide-file').value = '';
+        $('#slide-status').textContent = ''; $('#slide-status').hidden = true;
+        $('#question-input').value = state.draftTexts.get(state.session?.id) || '';
         showStudyStatus('');
         state.renderKeys = {};
         state.settingsDirty = false;
         const persistedTime = Number(localStorage.getItem(`classroom-time-${state.session?.id}`)) || 0;
         state.clockSeconds = Math.max(persistedTime, ...(state.session?.segments || []).map((segment) => Number(segment.end) || 0), ...(state.session?.audio || []).map((item) => (Number(item.start) || 0) + (Number(item.duration) || 0)));
         $('#question-context').hidden = true;
+        await restoreDraft(viewScope());
       }
       render();
     } catch (error) {
@@ -856,19 +1198,22 @@
 
   async function saveSettings() {
     clearTimeout(state.settingsTimer);
+    const scope = viewScope();
     if (state.settingsPromise) await state.settingsPromise;
+    if (!inView(scope)) return;
     if (!state.settingsDirty || !state.session) return;
     const generation = state.saveGeneration;
-    const payload = { title: $('#course-title').value.trim() || '未命名课程', terms: $('#course-terms').value.trim(), auto_analyze: $('#auto-analyze').checked };
+    const payload = { session_id: scope.sessionId, title: $('#course-title').value.trim() || '未命名课程', terms: $('#course-terms').value.trim(), auto_analyze: $('#auto-analyze').checked };
     state.settingsPromise = api('/api/settings', { method: 'PUT', body: payload });
     try {
       await state.settingsPromise;
+      if (!inView(scope)) return;
       if (generation === state.saveGeneration) state.settingsDirty = false;
       state.session.title = payload.title;
       state.session.settings = { ...state.session.settings, ...payload };
       $('#save-status').textContent = state.settingsDirty ? '正在保存…' : '已保存';
     } catch (error) {
-      $('#save-status').textContent = '保存失败';
+      if (inView(scope)) $('#save-status').textContent = '保存失败';
       throw error;
     } finally {
       state.settingsPromise = null;
@@ -876,7 +1221,7 @@
   }
 
   function canSwitch() {
-    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.finalizing.size || state.switching || state.slideBusy || state.studyBusy) {
+    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.finalizing.size || state.switching || state.slideBusy || state.slideRecoveryBusy || state.studyBusy) {
       toast('请先暂停录音，并等待音频、课件和问题提交完成后再切换课程。', true);
       return false;
     }
@@ -884,16 +1229,16 @@
   }
 
   async function newSession(title) {
-    await saveSettings();
     state.switching = true;
-    renderQueue();
+    renderQueue(); renderSlides();
     try {
+      await saveSettings();
       await api('/api/sessions', { method: 'POST', body: { title: title || `课堂笔记 ${new Date().toLocaleDateString('zh-CN')}` } });
       state.renderKeys = {};
       await poll(true);
     } finally {
       state.switching = false;
-      renderQueue();
+      renderQueue(); renderSlides();
     }
   }
 
@@ -1310,6 +1655,30 @@
   $('#ai-settings-dialog').addEventListener('cancel', () => { $('#ai-key').value = ''; $('#ai-clear-key').checked = false; });
 
   $('#slide-file').addEventListener('change', () => uploadSlide($('#slide-file').files?.[0]));
+  $('#pending-slides-list').addEventListener('click', async (event) => {
+    const button = event.target.closest('[data-upload-retry], [data-upload-clear]');
+    if (!button || state.slideBusy || state.slideRecoveryBusy || state.switching) return;
+    const id = button.dataset.uploadRetry || button.dataset.uploadClear;
+    const record = pendingSlides().find((item) => item.id === id && item.session_id === state.session?.id);
+    if (!record) return;
+    if (button.dataset.uploadRetry) return recoverSlide(record);
+    const scope = viewScope(); state.slideRecoveryBusy = true; renderPendingSlides(); renderQueue();
+    try { await clearPendingSlide(id); }
+    catch (error) { if (inView(scope)) toast(error.message, true); }
+    finally { state.slideRecoveryBusy = false; renderPendingSlides(); renderQueue(); }
+  });
+  $('#clear-pending-slides').addEventListener('click', async () => {
+    if (!state.session || state.slideBusy || state.slideRecoveryBusy) return;
+    const scope = viewScope(); state.slideRecoveryBusy = true; renderPendingSlides(); renderQueue();
+    const ids = pendingSlides().filter((item) => item.session_id === scope.sessionId).map((item) => item.id);
+    try {
+      if (window.studyCache) { cacheNotice(await window.studyCache.clearUploads(scope.sessionId)); state.cachedSlides = await window.studyCache.listUploads(); }
+      for (const [id, item] of state.transientSlides) if (item.session_id === scope.sessionId) state.transientSlides.delete(id);
+      for (const id of ids) if (state.slideURLs.has(id)) { URL.revokeObjectURL?.(state.slideURLs.get(id)); state.slideURLs.delete(id); }
+      if (inView(scope)) { $('#slide-status').textContent = '已清理本课浏览器暂存，后台已保存的课件和历史回答不受影响。'; $('#slide-status').hidden = false; }
+    } catch (error) { if (inView(scope)) toast(error.message, true); }
+    finally { state.slideRecoveryBusy = false; renderPendingSlides(); renderQueue(); }
+  });
   $('#slide-paste').addEventListener('paste', (event) => {
     const images = [...(event.clipboardData?.items || [])].filter((item) => item.type.startsWith('image/'));
     if (!images.length) return;
@@ -1328,6 +1697,10 @@
     renderSlides();
   });
   $('#slides-gallery').addEventListener('click', (event) => { const button = event.target.closest('[data-slide-edit]'); if (button) editSlide(button.dataset.slideEdit); });
+  $('#slide-rotate-left').addEventListener('click', () => previewRotation(-90));
+  $('#slide-rotate-right').addEventListener('click', () => previewRotation(90));
+  $('#slide-save-rotation').addEventListener('click', saveRotation);
+  $('#slide-remove').addEventListener('click', removeSlide);
   $('#slide-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     if (state.slideBusy || !state.editingSlide || !$('#slide-form').reportValidity()) return;
@@ -1338,10 +1711,13 @@
     state.slideBusy = true; $('#slide-save').disabled = true; renderQueue();
     try {
       await api(`/api/slides/${encodeURIComponent(editing.id)}`, { method: 'PATCH', body: { session_id: editing.sessionId, start, end, title: $('#slide-title').value } });
-      $('#slide-status').hidden = false;
-      $('#slide-status').textContent = `课件范围已更新：${rangeText({ start, end })}。已有问题仍保留当时的课件范围。`;
-      $('#slide-dialog').close(); await poll(true);
-    } catch (error) { $('#slide-edit-status').textContent = error.message; $('#slide-edit-status').hidden = false; }
+      if (inView(editing) && state.editingSlide === editing) {
+        $('#slide-status').hidden = false;
+        $('#slide-status').textContent = `课件范围已更新：${rangeText({ start, end })}。已有问题仍保留当时的课件范围。`;
+        $('#slide-dialog').close();
+      }
+      await poll(true);
+    } catch (error) { if (inView(editing) && state.editingSlide === editing) { $('#slide-edit-status').textContent = error.message; $('#slide-edit-status').hidden = false; } }
     finally { state.slideBusy = false; $('#slide-save').disabled = false; renderSlides(); renderQueue(); }
   });
   for (const button of document.querySelectorAll('[data-study-mode]')) button.addEventListener('click', () => {
@@ -1358,6 +1734,17 @@
   });
   $('#study-send').addEventListener('click', () => confirmStudy());
   $('#study-text-only').addEventListener('click', () => confirmStudy(true));
+  $('#study-confirm-original').addEventListener('change', renderStudyReview);
+  $('#study-confirm-duplicate').addEventListener('change', renderStudyReview);
+  $('#study-refresh-materials').addEventListener('click', () => { if (state.studyReview && !state.studyBusy) return refreshStudy(state.studyReview.question, $('#study-confirm-duplicate').checked); });
+  $('#legacy-request-check').addEventListener('click', () => {
+    const record = state.legacyRequests.get(state.session?.id);
+    if (record) return record.kind === 'study' ? recoverStudyRequest(record) : submitLegacyQuestion(record);
+  });
+  $('#duplicate-retry-send').addEventListener('click', () => {
+    if (!state.pendingLegacyRetry || !$('#duplicate-retry-consent').checked) { $('#duplicate-retry-status').textContent = '请先确认可能重复计费。'; $('#duplicate-retry-status').hidden = false; return; }
+    return executeLegacyRetry(state.pendingLegacyRetry, true);
+  });
   $('#questions-list').addEventListener('click', (event) => {
     const button = event.target.closest('[data-study-review], [data-study-retry], [data-study-refresh]');
     if (!button || state.studyBusy) return;
@@ -1453,7 +1840,7 @@
     if (!button) return;
     const segment = (state.session?.segments || []).find((item) => item.id === button.dataset.editSegment);
     if (!segment) return;
-    state.editingSegment = { id: segment.id, sessionId: state.session.id };
+    state.editingSegment = { id: segment.id, sessionId: state.session.id, epoch: state.sessionEpoch };
     $('#edit-segment-text').value = segment.text || '';
     renderInputLimits();
     $('#edit-original-text').textContent = segment.machine_text ?? segment.text ?? '';
@@ -1463,16 +1850,15 @@
   $('#edit-segment-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const target = state.editingSegment;
-    if (!target) return;
+    if (!target || !inView(target)) return;
     const text = validatedText('#edit-segment-text');
     if (text === null) return;
     const button = event.submitter; button.disabled = true;
     try {
       await api(`/api/segments/${encodeURIComponent(target.id)}/edit`, { method: 'POST', body: { text, session_id: target.sessionId } });
       await poll(true);
-      $('#edit-segment-dialog').close();
-      toast('原文已修改，机器原稿保留。相关解释会标为待更新。');
-    } catch (error) { toast(error.message, true); }
+      if (inView(target) && state.editingSegment === target) { $('#edit-segment-dialog').close(); toast('原文已修改，机器原稿保留。相关解释会标为待更新。'); }
+    } catch (error) { if (inView(target)) toast(error.message, true); }
     finally { button.disabled = false; }
   });
 
@@ -1545,13 +1931,13 @@
   $('#session-select').addEventListener('change', async (event) => {
     const id = event.target.value;
     if (!canSwitch()) { event.target.value = state.session?.id || ''; return; }
+    state.switching = true; renderQueue(); renderSlides();
     try {
       await saveSettings();
-      state.switching = true; renderQueue();
       await api(`/api/sessions/${encodeURIComponent(id)}/select`, { method: 'POST' });
       await poll(true);
     } catch (error) { toast(error.message, true); event.target.value = state.session?.id || ''; }
-    finally { state.switching = false; renderQueue(); }
+    finally { state.switching = false; renderQueue(); renderSlides(); }
   });
   $('#new-session').addEventListener('click', () => {
     if (!canSwitch()) return;
@@ -1582,16 +1968,22 @@
 
   $('#text-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    if ($('#add-text').disabled) return;
+    if ($('#add-text').disabled || state.switching) return;
     const text = validatedText('#manual-text');
     if (text === null) return;
+    let scope = viewScope();
+    const fromDemo = isDemo();
     $('#add-text').disabled = true;
     try {
-      await ensureRealSession(); await saveSettings();
-      await api('/api/text', { method: 'POST', body: { text, session_id: state.session.id } });
-      if ($('#manual-text').value === text) $('#manual-text').value = '';
+      await ensureRealSession();
+      if (fromDemo) scope = viewScope();
+      if (!inView(scope)) return;
+      await saveSettings();
+      if (!inView(scope)) return;
+      await api('/api/text', { method: 'POST', body: { text, session_id: scope.sessionId } });
+      if (inView(scope) && $('#manual-text').value === text) $('#manual-text').value = '';
       await poll(true);
-    } catch (error) { toast(error.message, true); }
+    } catch (error) { if (inView(scope)) toast(error.message, true); }
     finally { $('#add-text').disabled = false; }
   });
 
@@ -1627,17 +2019,22 @@
   $('#clear-context').addEventListener('click', () => { state.selectedGroup = null; $('#question-context').hidden = true; render(); });
   $('#questions-list').addEventListener('click', (event) => {
     const button = event.target.closest('[data-question]');
-    if (button) { $('#question-input').value = button.dataset.question; renderInputLimits(); $('#question-input').focus(); }
+    if (button) { $('#question-input').value = button.dataset.question; rememberDraft(state.session?.id, $('#question-input').value); renderInputLimits(); $('#question-input').focus(); }
   });
+  $('#question-input').addEventListener('input', () => rememberDraft(state.session?.id, $('#question-input').value));
   $('#question-input').addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); $('#question-form').requestSubmit(); }
   });
   $('#question-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    if ($('#ask-button').disabled || state.studyBusy) return;
+    if ($('#ask-button').disabled || state.studyBusy || state.switching) return;
+    if (state.legacyRequests.has(state.session?.id)) { renderLegacyRecovery(); toast('请先核对本课上一个待确认的问题，当前草稿保留。', true); return; }
     const question = validatedText('#question-input');
     if (question === null) return;
     if (isDemo()) { toast('演示模式不调用 AI。请新建课程并加入真实课堂原文后提问。'); return; }
+    const scope = viewScope();
+    const groupId = state.selectedGroup;
+    rememberDraft(scope.sessionId, question);
     if ($('#include-slides').checked) {
       const params = frozenStudyParams(state.selectedGroup ? 'group' : $('#study-range').value || 'recent120', question, false);
       return prepareStudy(params);
@@ -1645,44 +2042,46 @@
     $('#ask-button').disabled = true;
     try {
       await saveSettings();
-      await api('/api/ask', { method: 'POST', body: { question, ...(state.selectedGroup ? { group_id: state.selectedGroup } : {}) } });
-      if ($('#question-input').value === question) $('#question-input').value = '';
-      await poll(true);
-      $('#questions-list').scrollTop = $('#questions-list').scrollHeight;
-    } catch (error) { toast(error.message, true, 8000); }
+      if (!inView(scope)) return;
+      await submitLegacyQuestion({ kind: 'legacy-ask', request_id: newRequestId(), body: { session_id: scope.sessionId, question, ...(groupId ? { group_id: groupId } : {}) } }, true);
+      if (inView(scope)) $('#questions-list').scrollTop = $('#questions-list').scrollHeight;
+    } catch (error) { if (inView(scope)) toast(error.message, true, 8000); }
     finally { $('#ask-button').disabled = false; }
   });
 
   document.addEventListener('click', async (event) => {
     const button = event.target.closest('[data-retry-group], [data-retry-question], [data-retry-audio]');
-    if (!button || isDemo()) return;
+    if (!button || isDemo() || state.switching || state.studyBusy) return;
     const type = button.dataset.retryGroup ? 'groups' : button.dataset.retryQuestion ? 'questions' : 'audio';
     const id = button.dataset.retryGroup || button.dataset.retryQuestion || button.dataset.retryAudio;
-    button.disabled = true;
-    try {
-      await saveSettings();
-      await api(`/api/${type}/${encodeURIComponent(id)}/retry`, { method: 'POST', body: { session_id: state.session.id } });
-      await poll(true);
-      toast(type === 'audio' ? '已加入本机转写队列。' : '已加入 AI 处理队列。');
-    } catch (error) { toast(error.message, true); }
-    finally { button.disabled = false; }
+    const item = (state.session?.[type] || []).find((entry) => String(entry.id ?? entry.seq) === id);
+    const operation = { scope: viewScope(), type, id };
+    if (type !== 'audio' && resultUnknown(item)) {
+      state.pendingLegacyRetry = operation; $('#duplicate-retry-consent').checked = false;
+      $('#duplicate-retry-status').hidden = true;
+      $('#duplicate-retry-description').textContent = `${item.question || '这段课堂分析'}。前次调用可能已经处理或计费，再次请求可能重复计费。`;
+      $('#duplicate-retry-dialog').showModal(); return;
+    }
+    return executeLegacyRetry(operation);
   });
 
   document.querySelectorAll('[data-export]').forEach((button) => button.addEventListener('click', async () => {
+    const scope = viewScope();
+    const title = state.session?.title || '课堂笔记';
     try {
       await saveSettings();
       const format = button.dataset.export;
-      const response = await api(`/api/export?format=${format}`, { raw: true });
+      const response = await api(`/api/export?format=${format}&session_id=${encodeURIComponent(scope.sessionId)}`, { raw: true });
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
-      link.download = `${(state.session?.title || '课堂笔记').replace(/[\\/:*?"<>|]/g, '_')}.${format === 'json' ? 'json' : 'md'}`;
+      link.download = `${title.replace(/[\\/:*?"<>|]/g, '_')}.${format === 'json' ? 'json' : 'md'}`;
       document.body.appendChild(link); link.click(); link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 10000);
       $('.export-menu').open = false;
-      toast('已导出当前记录。仍在队列中的转写或分析尚未包含在内。');
-    } catch (error) { toast(error.message, true); }
+      if (inView(scope)) toast('已导出当前记录。仍在队列中的转写或分析尚未包含在内。');
+    } catch (error) { if (inView(scope)) toast(error.message, true); }
   }));
 
   $('#copy-codex').addEventListener('click', async () => {
@@ -1701,7 +2100,7 @@
 
   document.addEventListener('click', (event) => { if (!event.target.closest('.export-menu')) $('.export-menu').open = false; });
   window.addEventListener('beforeunload', (event) => {
-    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.settingsDirty || state.finalizing.size || state.slideBusy || state.studyBusy) {
+    if (state.captureMode !== 'idle' || state.uploadQueue.length || state.settingsDirty || state.finalizing.size || state.slideBusy || state.slideRecoveryBusy || state.studyBusy || state.transientSlides.size) {
       event.preventDefault(); event.returnValue = '';
     }
   });
@@ -1709,7 +2108,7 @@
 
   async function initialize() {
     renderInputLimits();
-    await Promise.allSettled([poll(), initializeQueue(), enumerateMicrophones()]);
+    await Promise.allSettled([poll(), initializeQueue(), ensureStudyCache(), enumerateMicrophones()]);
     if (!state.uploadQueue.length) await finalizeReadySessions();
     setInterval(async () => {
       await poll();

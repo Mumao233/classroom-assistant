@@ -77,10 +77,11 @@ def test_direct_send_requires_matching_explicit_consent(room_factory):
     with pytest.raises(HTTPException):
         send(room, q, confirm_images=True, destination_token='stale')
     assert room.ai_queue.empty()
-    send(room, q, confirm_images=True)
+    first = send(room, q, confirm_images=True)
     assert room.study_question(room.get(), q['id'])['status'] == 'pending'
-    with pytest.raises(HTTPException):
-        send(room, q, confirm_images=True)
+    duplicate = send(room, q, confirm_images=True)
+    assert duplicate['job_id'] == first['job_id']
+    assert room.ai_queue.qsize() == 1
 
 
 def test_approval_scope_is_classroom_image_and_destination(room_factory):

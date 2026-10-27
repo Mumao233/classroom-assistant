@@ -70,6 +70,9 @@ class ClassroomFeatures:
             for course in self.courses:
                 if course.get("status") in ("pending", "running"):
                     course.update(status="error", error="上次术语生成中断，请重新生成。")
+                    if course.get('dispatch_started_at') and not course.get('dispatch_completed_at'):
+                        course.update(result_unknown=True, dispatch_state='unknown',
+                                      error='请求结果未知，无法确定服务商是否已处理；未自动重新提交。')
             if not target.exists():
                 self.save_courses()
         except (OSError, ValueError, KeyError, TypeError):
@@ -212,7 +215,11 @@ class ClassroomFeatures:
             for s in self.sessions.values():
                 pending = [g for g in s["groups"] if g.get("status") == "paused"]
                 for g in pending:
-                    if strategy == "latest" and g.get("automatic") and g is not pending[-1]:
+                    if g.get('result_unknown'):
+                        g['status'] = 'error'
+                        if g.get('job_id') in self.jobs:
+                            self.jobs[g['job_id']]['status'] = 'error'
+                    elif strategy == "latest" and g.get("automatic") and g is not pending[-1]:
                         g.update(status="skipped", error="按你的选择略过旧的自动解释；原文保留，可单独分析。")
                         if g.get("job_id") in self.jobs:
                             self.jobs[g["job_id"]]["status"] = "skipped"
@@ -220,11 +227,21 @@ class ClassroomFeatures:
                         self._enqueue_ai(s, g, "analysis", automatic=g.get("automatic", False))
                 for q in s["questions"]:
                     if q.get("status") == "paused":
-                        self._enqueue_ai(s, q, "question")
+                        if q.get('result_unknown') or (q.get('study') and q.get('dispatch_started_at')):
+                            q['status'] = 'error'
+                            if q.get('job_id') in self.jobs:
+                                self.jobs[q['job_id']]['status'] = 'error'
+                        else:
+                            self._enqueue_ai(s, q, "question")
                 self.save(s)
             for c in self.courses:
                 if c.get("status") == "paused":
-                    self._enqueue_ai(self.get(c.get("ai_session_id")), c, "glossary")
+                    if c.get('result_unknown'):
+                        c['status'] = 'error'
+                        if c.get('job_id') in self.jobs:
+                            self.jobs[c['job_id']]['status'] = 'error'
+                    else:
+                        self._enqueue_ai(self.get(c.get("ai_session_id")), c, "glossary")
             self.save_courses()
             write_json(self.data / "ai-state.json", self.ai)
             self.ai_ready.set()
