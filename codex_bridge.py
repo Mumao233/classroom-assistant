@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from course_catalog import GlossaryValidationError, parse_glossary
+from review_schema import REVIEW_INSTRUCTIONS, review_allowed_refs, review_prompt
 
 
 class CodexBridgeError(RuntimeError):
@@ -300,7 +301,8 @@ class CodexBridge:
         return command
 
     def _run(self, prompt: str, source: str, *, images: list[dict] | None = None,
-             cancel_event=None, instructions: str = _INSTRUCTIONS, allowed_refs: set[str] | None = None) -> str:
+             cancel_event=None, instructions: str = _INSTRUCTIONS, allowed_refs: set[str] | None = None,
+             validate_output_refs: bool = True) -> str:
         started = time.monotonic()
         with self._lock:
             self._active += 1
@@ -347,7 +349,8 @@ class CodexBridge:
             if process.returncode != 0:
                 raise _error_from_diagnostics(stdout + "\n" + stderr)
             answer = _read_final(stdout)
-            _validate_references(answer, source, allowed_refs)
+            if validate_output_refs:
+                _validate_references(answer, source, allowed_refs)
             _check_cancelled(cancel_event)
             with self._lock:
                 self._inference_verified = True
@@ -462,6 +465,31 @@ class CodexBridge:
         allowed = {ref for ref in _VISUAL_REFERENCE.findall(context) if ref.startswith("S")} | ids
         return self._run(prompt, context, images=normalized, cancel_event=cancel_event,
                          instructions=_VISUAL_INSTRUCTIONS, allowed_refs=allowed)
+
+    def generate_review(self, evidence: dict, options: dict, images: list[dict], *, cancel_event=None) -> str:
+        """One explicit review batch. The workflow validates/persists the raw reply."""
+        _check_cancelled(cancel_event)
+        try:
+            prompt = review_prompt(evidence, options)
+            allowed = review_allowed_refs(evidence)
+        except (ValueError, TypeError, KeyError):
+            raise CodexBridgeError('复习材料格式无效，请重新准备；尚未发送。') from None
+        if len(prompt) + len(REVIEW_INSTRUCTIONS) + 4000 > self.context_chars:
+            raise CodexBridgeError('复习材料超过应用输入预算，请缩小批次；未自动截断或发送。')
+        expected = [p['id'] for p in evidence.get('slides', [])]
+        if not isinstance(images, list) or len(images) > 4:
+            raise CodexBridgeError('每批最多四张课件；尚未发送。')
+        normalized = []
+        for item in images:
+            if (not isinstance(item, dict) or not isinstance(item.get('path'), str)
+                    or not Path(item['path']).is_absolute()
+                    or item.get('mime_type') not in ('image/png', 'image/jpeg', 'image/webp')):
+                raise CodexBridgeError('复习图片资料无效；尚未发送。')
+            normalized.append({k: item[k] for k in ('id', 'path', 'mime_type', 'start', 'end') if k in item})
+        if [p.get('id') for p in normalized] != expected or len(set(expected)) != len(expected):
+            raise CodexBridgeError('复习图片与确认的材料不一致；尚未发送。')
+        return self._run(prompt, '', images=normalized, cancel_event=cancel_event,
+                         instructions=REVIEW_INSTRUCTIONS, allowed_refs=allowed, validate_output_refs=False)
 
     def generate_glossary(self, course_name: str, syllabus: str = "") -> list[dict[str, Any]]:
         """Generate preparatory vocabulary, never claims about a recorded class."""

@@ -189,6 +189,8 @@ class ClassroomFeatures:
     def _pause_ai(self, kind, reason):
         self.ai.update(paused=True, kind=kind, reason=reason, paused_at=stamp())
         self.ai_ready.clear()
+        if hasattr(self, 'review_pause_pending'):
+            self.review_pause_pending(reason)
         for s in self.sessions.values():
             for item in s["groups"] + s["questions"]:
                 if item.get("status") == "pending":

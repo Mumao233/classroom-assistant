@@ -34,6 +34,9 @@ from session_order import creation_order, newest_first
 from input_limits import INPUT_LIMITS, require_content, validation_message
 from study_workflow import StudyWorkflow, UNKNOWN_TIMEOUT, UNKNOWN_RESULT
 from slide_context import image_dimensions, image_size_message
+from review_workflow import ReviewWorkflow, register_review_routes
+from portable_package import portable_session_projection, portable_markdown
+from portable_routes import register_portable_routes
 
 ROOT = Path(__file__).resolve().parent
 
@@ -90,7 +93,7 @@ def source_line(seg):
     return f"[{seg['id']}] {classroom_time(seg['start'])}–{classroom_time(seg['end'])} {seg['text']}"
 
 
-class Classroom(StudyWorkflow, ClassroomFeatures):
+class Classroom(ReviewWorkflow, StudyWorkflow, ClassroomFeatures):
     def __init__(self, data: Path, config: dict, engine=None, bridge=None):
         self.data = data
         data.mkdir(parents=True, exist_ok=True)
@@ -149,6 +152,7 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                             item.update(status="error", error="上次运行中断，可重试这一项。")
                     if item.get("stream_status") == "streaming":
                         item["stream_status"] = "interrupted"
+                self.review_restore(s)
                 self.sessions[s["id"]] = s
             except (OSError, ValueError, TypeError):
                 self.warnings.append(f"有一份历史课程文件无法读取，原文件已保留：{path.parent.name}")
@@ -212,7 +216,9 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
             newest = max((a["start"] + a["duration"] for a in active["audio"]), default=0)
             lag = max(0, newest - min((a["start"] for a in remaining), default=newest))
             soundcheck = {k: v for k, v in self.soundcheck.items() if k not in ("path", "prompt")}
-            return {"session": self.study_session_public(active),
+            public_session = self.study_session_public(active)
+            public_session['review'] = self.review_public(active)
+            return {"session": public_session,
                     "courses": copy.deepcopy(self.courses), "ai": copy.deepcopy(self.ai), "soundcheck": soundcheck,
                     "sessions": [{k: s[k] for k in ("id", "title", "created_at", "demo")} for s in newest_first(self.sessions.values())],
                     "status": {"asr": asr_status, "codex": codex_status, "ai": self.ai_status(codex_status)},
@@ -220,7 +226,7 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                     "ai_usage": copy.deepcopy(active.get("ai_usage", empty_usage())),
                     "jobs": [copy.deepcopy(j) for j in list(self.jobs.values())[-120:] if j["session_id"] == active["id"]],
                     "queue": {"audio": sum(j["kind"] == "audio" and j["status"] in ("pending", "running") for j in self.jobs.values()),
-                              "ai": sum(j["kind"] in ("question", "analysis", "glossary") and j["status"] in ("pending", "running", "paused") for j in self.jobs.values()),
+                              "ai": sum(j["kind"] in ("question", "analysis", "glossary", "review") and j["status"] in ("pending", "running", "paused") for j in self.jobs.values()),
                               "lag_seconds": round(lag, 1)},
                     "warnings": self.warnings}
 
@@ -251,7 +257,7 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                 if routing_changed and self.study_busy() and not payload.get("force"):
                     raise HTTPException(409, "正在加载，暂不能更换 AI 接入；可选择强制更换并重新确认发送目的地。")
                 if routing_changed:
-                    has_waiting = any(j["kind"] in ("question", "analysis", "glossary") and j["status"] in ("pending", "paused", "running") for j in self.jobs.values())
+                    has_waiting = any(j["kind"] in ("question", "analysis", "glossary", "review") and j["status"] in ("pending", "paused", "running") for j in self.jobs.values())
                     keep_paused = bool(self.active_ai or has_waiting or self.ai["paused"])
                     self.ai_switch_pending = self.active_ai is not None
                     # Freeze before ANY routing/default persistence. Even a
@@ -265,6 +271,7 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                 self.connection.save(payload)
                 if routing_changed:
                     self.invalidate_study_destination()
+                    self.invalidate_review_destination()
                     self.api_last_status = {}
                     if not keep_paused:
                         resumed = {**self.ai, "paused": False, "kind": None, "reason": None}
@@ -601,6 +608,12 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
                 _, _, sid, item_id, kind, jid = self.ai_queue.get(timeout=.4)
             except queue.Empty:
                 continue
+            if kind == 'review':
+                try:
+                    self.review_process_job(sid, item_id, jid)
+                finally:
+                    self.ai_queue.task_done()
+                continue
             with self.lock:
                 s = self.get(sid)
                 items = self.courses if kind == "glossary" else s["groups"] if kind == "analysis" else s["questions"]
@@ -859,6 +872,7 @@ class Classroom(StudyWorkflow, ClassroomFeatures):
             lines += ["## API 用量", "", f"请求 {usage['requests']} 次；成功 {usage.get('completed', 0)} 次；失败 {usage.get('failed', 0)} 次。",
                       f"中断后结果未知 {usage.get('unknown', 0)} 次（可能已计费）。",
                       f"其中 {usage.get('usage_reported_requests', 0)} 次返回 token 用量，已报告总量 {usage.get('total_tokens', 0)}；未返回的部分未知，实际费用以服务商账单为准。", ""]
+        lines += self.review_export_lines(s)
         return "\n".join(lines)
 
     @staticmethod
@@ -1253,13 +1267,15 @@ def create_app(config=None, data=None, engine=None, bridge=None):
         with room.lock:
             s = copy.deepcopy(room.get(session_id))
         if format == "json":
-            return Response(json.dumps(s, ensure_ascii=False, indent=2), media_type="application/json", headers={"Content-Disposition": 'attachment; filename="classroom-notes.json"'})
-        return Response(room.markdown(s), media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="classroom-notes.md"'})
+            return Response(json.dumps(portable_session_projection(s, room.data), ensure_ascii=False, indent=2), media_type="application/json", headers={"Content-Disposition": 'attachment; filename="classroom-notes.json"'})
+        return Response(portable_markdown(s, room.data), media_type="text/markdown; charset=utf-8", headers={"Content-Disposition": 'attachment; filename="classroom-notes.md"'})
 
     @app.get("/")
     def index():
         return FileResponse(ROOT / "static" / "index.html")
 
+    register_review_routes(app, room)
+    register_portable_routes(app, room)
     app.mount("/static", StaticFiles(directory=ROOT / "static", check_dir=False), name="static")
     return app
 

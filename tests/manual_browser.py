@@ -2,7 +2,7 @@
 
 python tests/manual_browser.py --data-dir <NEW-ISOLATED-DIRECTORY> --port 8768
 Visit / for the app, /acceptance/cache for native IndexedDB checks.
-POST /acceptance/flags/{fail_upload|lose_send|model_timeout}/{true|false} to
+POST /acceptance/flags/{fail_upload|lose_send|model_timeout|review_invalid}/{true|false} to
 inject failures. Existing non-fixture directories are refused.
 """
 import argparse
@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from app import create_app
 from codex_bridge import CodexBridgeError
 from test_app import FakeASR, FakeBridge
+from review_fixture import synthetic_review_result
 
 
 def build(data):
@@ -24,9 +25,19 @@ def build(data):
         raise ValueError('Refusing an existing non-fixture directory; use a new isolated folder.')
     data.mkdir(parents=True, exist_ok=True)
     marker.write_text('Synthetic browser acceptance only. No real classroom data.', encoding='utf-8')
-    flags = dict(fail_upload=False, lose_send=False, model_timeout=False)
+    flags = dict(fail_upload=False, lose_send=False, model_timeout=False, review_invalid=False)
 
     class Bridge(FakeBridge):
+        context_chars = 48000
+
+        def generate_review(self, evidence, options, images, **kwargs):
+            self.calls.append({'kind': 'review', 'sources': evidence.get('source_ids', []),
+                               'images': [p['id'] for p in images]})
+            if flags['model_timeout']:
+                raise CodexBridgeError('synthetic timeout', kind='timeout')
+            time.sleep(.3)
+            return '{"interrupted":' if flags['review_invalid'] else synthetic_review_result(evidence, options)
+
         def ask_visual(self, context, question, images, **kwargs):
             self.calls.append({'context': context, 'question': question, 'images': [p['id'] for p in images]})
             if flags['model_timeout']:

@@ -205,7 +205,8 @@ class ApiBridge(CodexBridge):
 
     def _run(self, prompt: str, source: str, *, emit: bool = True,
              max_tokens: int | None = None, instructions: str = _INSTRUCTIONS,
-             images: list[dict] | None = None, cancel_event=None, allowed_refs: set[str] | None = None) -> str:
+             images: list[dict] | None = None, cancel_event=None, allowed_refs: set[str] | None = None,
+             validate_output_refs: bool = True) -> str:
         if cancel_event is None:
             self._request_lock.acquire()
         else:
@@ -216,12 +217,12 @@ class ApiBridge(CodexBridge):
             _check_cancelled(cancel_event)
             return self._request(prompt, source, emit=emit and not getattr(self._local, "suppress_delta", False),
                                  max_tokens=max_tokens, instructions=instructions, images=images,
-                                 cancel_event=cancel_event, allowed_refs=allowed_refs)
+                                 cancel_event=cancel_event, allowed_refs=allowed_refs, validate_output_refs=validate_output_refs)
         finally:
             self._request_lock.release()
 
     def _request(self, prompt, source, *, emit, max_tokens, instructions,
-                 images=None, cancel_event=None, allowed_refs=None):
+                 images=None, cancel_event=None, allowed_refs=None, validate_output_refs=True):
         started = time.monotonic()
         with self._lock:
             self._active += 1
@@ -282,7 +283,8 @@ class ApiBridge(CodexBridge):
                         raise _failure(kind)
                     answer = self._read_response(response, started, emit, cancel_event)
             _check_cancelled(cancel_event)
-            _validate_references(answer, source, allowed_refs)
+            if validate_output_refs:
+                _validate_references(answer, source, allowed_refs)
             with self._lock:
                 self._inference_verified = True
                 self._last_success_at = time.time()

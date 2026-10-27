@@ -585,8 +585,8 @@
     $('#study-range-label').hidden = !$('#include-slides').checked;
     $('#slide-file').disabled = state.slideBusy || state.slideRecoveryBusy || state.switching || isDemo() || !state.connected;
     $('#slides-auto').disabled = state.studyBusy;
-    const key = JSON.stringify([state.session?.id, slides, state.slideSelection === null ? null : [...state.slideSelection], state.studyBusy]);
-    const html = slides.map((slide) => `<article class="slide-card"><label><input type="checkbox" data-slide-select="${escapeHTML(slide.id)}" ${state.slideSelection?.has(slide.id) ? 'checked' : ''} ${state.slideSelection === null || state.studyBusy ? 'disabled' : ''}><span>${escapeHTML(slide.title || slide.id)}</span></label><button class="slide-thumbnail" data-slide-edit="${escapeHTML(slide.id)}" aria-label="查看 ${escapeHTML(slide.title || slide.id)}"><img src="${slideURL(slide.id, state.session.id)}" alt="${escapeHTML(slide.title || slide.id)}" loading="lazy"></button><div class="slide-caption"><span class="timecode">${escapeHTML(rangeText(slide))}</span><button class="text-button" data-slide-edit="${escapeHTML(slide.id)}">编辑范围</button></div></article>`).join('');
+    const key = JSON.stringify([state.session?.id, slides, state.slideSelection === null ? null : [...state.slideSelection], state.studyBusy, state.session?.review?.marks, state.session?.review?.read_only]);
+    const html = slides.map((slide) => `<article class="slide-card" id="slide-${escapeHTML(slide.id)}"><label><input type="checkbox" data-slide-select="${escapeHTML(slide.id)}" ${state.slideSelection?.has(slide.id) ? 'checked' : ''} ${state.slideSelection === null || state.studyBusy ? 'disabled' : ''}><span>${escapeHTML(slide.title || slide.id)}</span></label><button class="slide-thumbnail" data-slide-edit="${escapeHTML(slide.id)}" aria-label="查看 ${escapeHTML(slide.title || slide.id)}"><img src="${slideURL(slide.id, state.session.id)}" alt="${escapeHTML(slide.title || slide.id)}" loading="lazy"></button><div class="slide-caption"><span class="timecode">${escapeHTML(rangeText(slide))}</span><button class="text-button" data-slide-edit="${escapeHTML(slide.id)}">编辑范围</button></div>${window.ReviewUI?.markButtons(state.session, 'slide', slide.id, isDemo() || !state.connected) || ''}</article>`).join('');
     replaceList('#slides-gallery', html || '<p class="small muted">还没有课件。可添加老师的幻灯片、板书照片或截图。</p>', key);
     for (const button of document.querySelectorAll('[data-study-mode]')) button.disabled = state.studyBusy || state.switching || isDemo() || !state.connected;
     $('#study-reprepare').disabled = state.studyBusy;
@@ -896,8 +896,8 @@
     const replay = (seq) => seq == null || session.audio_deleted_at || !(session.audio || []).some((item) => item.seq === seq && !item.deleted) ? '' : `<details class="audio-replay"><summary>回听原音频</summary><audio controls preload="none" src="/api/audio/${encodeURIComponent(seq)}?session_id=${encodeURIComponent(session.id)}">浏览器不支持音频播放。</audio></details>`;
     const reasonLabels = { no_speech: '未识别到清晰语音。', no_signal: '这段音频几乎没有声音。', suspected_hallucination: '这段识别结果可能不可靠，已暂不作为课堂原文。' };
     const audioErrorsHTML = flaggedAudio.map((item) => `<article class="transcript-item audio-error"><div class="transcript-meta"><span class="timecode">${timecode(item.start)} — ${timecode(Number(item.start) + Number(item.duration))}</span><span>音频已保存在本机</span></div><p class="analysis-error">${escapeHTML(item.error || item.warning || reasonLabels[item.reason] || '请核对这段录音。')}</p>${!segments.some((segment) => segment.audio_seq === item.seq) ? `<button class="text-button" data-retry-audio="${escapeHTML(item.seq)}">重试这段转写</button>` : ''}${replay(item.seq)}</article>`).join('');
-    const transcriptHTML = visibleSegments.map((segment) => `<article class="transcript-item${segment.needs_review ? ' needs-review' : ''}" id="segment-${escapeHTML(segment.id)}"><div class="transcript-meta"><span class="timecode">${timecode(segment.start)} — ${timecode(segment.end)}</span><span>${escapeHTML(segment.id)}</span><span class="source-tag">${segment.source === 'manual' || segment.source === 'text' ? '手动补充' : segment.source === 'demo' ? '演示原文' : '音频转写'}</span>${segment.edited ? '<span class="edited-badge">已修改</span>' : ''}</div>${segment.needs_review ? '<p class="review-note">这段识别需要核对，请回听原音频</p>' : ''}<p class="transcript-text">${escapeHTML(segment.text)}</p><div class="transcript-actions">${replay(segment.audio_seq)}${!isDemo() ? `<button class="text-button" data-edit-segment="${escapeHTML(segment.id)}">修改原文</button>` : ''}</div>${segment.edited && segment.machine_text != null ? `<details class="original-text"><summary>保留的机器原稿</summary><p>${escapeHTML(segment.machine_text)}</p></details>` : ''}</article>`).join('');
-    replaceList('#transcript-list', transcriptHTML + audioErrorsHTML || emptyTranscript, `${session.id}:${state.focusMode}:${session.audio_deleted_at}:${JSON.stringify(segments)}:${JSON.stringify(flaggedAudio)}:${JSON.stringify((session.audio || []).map((item) => [item.seq, item.deleted]))}`);
+    const transcriptHTML = visibleSegments.map((segment) => `<article class="transcript-item${segment.needs_review ? ' needs-review' : ''}" id="segment-${escapeHTML(segment.id)}"><div class="transcript-meta"><span class="timecode">${timecode(segment.start)} — ${timecode(segment.end)}</span><span>${escapeHTML(segment.id)}</span><span class="source-tag">${segment.source === 'manual' || segment.source === 'text' ? '手动补充' : segment.source === 'demo' ? '演示原文' : '音频转写'}</span>${segment.edited ? '<span class="edited-badge">已修改</span>' : ''}</div>${segment.needs_review ? '<p class="review-note">这段识别需要核对，请回听原音频</p>' : ''}<p class="transcript-text">${escapeHTML(segment.text)}</p>${window.ReviewUI?.markButtons(session, 'segment', segment.id, isDemo() || !state.connected) || ''}<div class="transcript-actions">${replay(segment.audio_seq)}${!isDemo() ? `<button class="text-button" data-edit-segment="${escapeHTML(segment.id)}">修改原文</button>` : ''}</div>${segment.edited && segment.machine_text != null ? `<details class="original-text"><summary>保留的机器原稿</summary><p>${escapeHTML(segment.machine_text)}</p></details>` : ''}</article>`).join('');
+    replaceList('#transcript-list', transcriptHTML + audioErrorsHTML || emptyTranscript, `${session.id}:${state.focusMode}:${session.audio_deleted_at}:${JSON.stringify(segments)}:${JSON.stringify(flaggedAudio)}:${JSON.stringify((session.audio || []).map((item) => [item.seq, item.deleted]))}:${JSON.stringify(session.review?.marks)}:${Boolean(session.review?.read_only)}`);
     const groupsHTML = visibleGroups.map((group) => {
       const index = groups.indexOf(group);
       const currentSource = (group.segment_ids || []).map((id) => segments.find((segment) => segment.id === id)?.text || '').join(' ');
@@ -942,6 +942,7 @@
     renderAfterClass();
     renderAnalysisMode();
     updateCaptureHealth();
+    reviewUI?.sync(session);
   }
 
   function renderEngineStatus() {
@@ -2120,5 +2121,25 @@
     }, 5000);
   }
   for (const field of textFields) $(field.selector).addEventListener('input', renderInputLimits);
+  const reviewUI = window.ReviewUI?.mount({
+    api, getSession: () => state.session, getSnapshot: () => state.snapshot, poll, toast,
+    beforePrepare: saveSettings,
+    jump: (id) => {
+      if (state.focusMode) setFocusMode(false);
+      state.followLive = false;
+      render();
+      const target = document.getElementById(`segment-${id}`);
+      if (!target) { toast('当前原文中没有此段，原快照仍保留在复习依据中。', true); return; }
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      target.classList.add('review-source-highlight');
+      setTimeout(() => target.classList.remove('review-source-highlight'), 2500);
+    },
+    showSlide: (id) => {
+      if (state.focusMode) setFocusMode(false);
+      const slide = (state.session?.slides || []).find((x) => x.id === id && !x.removed && !x.removed_at);
+      if (!slide) { toast('课件已从当前材料中移除；可在复习依据中查看原快照。', true); return; }
+      $('#slides-panel').open = true; editSlide(id);
+    },
+  });
   initialize().catch((error) => toast(error.message, true));
 })();
